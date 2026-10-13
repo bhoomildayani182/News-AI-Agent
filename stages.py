@@ -10,6 +10,7 @@ from google import genai
 from google.genai import types
 
 from config import Settings
+from openrouter_client import OpenRouterClient
 
 
 HEADINGS = (
@@ -91,7 +92,7 @@ def _request(client, settings, stage, instruction, data, *, search=False, schema
     if not candidates or candidates[0].finish_reason != types.FinishReason.STOP:
         raise ResearchError(f'{stage}: no complete response (blocked or truncated).')
     if not response.text or not response.text.strip():
-        raise ResearchError(f'{stage}: Gemini returned an empty response.')
+        raise ResearchError(f'{stage}: model returned an empty response.')
     return response
 
 
@@ -105,7 +106,7 @@ def plan_research(client, settings, topic):
 
 def research_web(client, settings, topic, plan):
     response = _request(client, settings, 'web research',
-        'Use Google Search to execute the plan. Verify the topic premise. Return '
+        'Use the available web search tool to execute the plan. Verify the topic premise. Return '
         'evidence notes with named sources, event/publication dates, figures, '
         'supporting excerpts and unknowns. Seek multiple independent sources. '
         'Record what each publisher contributes, and distinguish official statements, '
@@ -321,9 +322,11 @@ def cited_source_numbers(report_text: str) -> set[int]:
 
 def research_topic(topic: str, settings: Settings, *, thorough: bool = False) -> ResearchResult:
     """Run a three-call fast pipeline or the six-call thorough pipeline."""
-    with genai.Client(api_key=settings.api_key, vertexai=False,
-                      http_options=types.HttpOptions(timeout=60_000,
-                          retry_options=types.HttpRetryOptions(attempts=2))) as client:
+    client_context = (OpenRouterClient(settings.api_key) if settings.provider == 'openrouter'
+        else genai.Client(api_key=settings.api_key, vertexai=False,
+                          http_options=types.HttpOptions(timeout=60_000,
+                              retry_options=types.HttpRetryOptions(attempts=2))))
+    with client_context as client:
         if thorough:
             print('[1/6] Research planning', flush=True)
             plan = plan_research(client, settings, topic)

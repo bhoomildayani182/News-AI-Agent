@@ -15,6 +15,7 @@ from demo import DEMO_TOPIC, demo_result
 from email_delivery import (EmailConfigurationError, build_email, send_email,
                             validate_email_settings)
 from stages import ResearchError, format_report, research_topic
+from openrouter_client import OpenRouterError
 
 
 def get_topic() -> str:
@@ -48,7 +49,7 @@ def main() -> int:
     try:
         # Demo previews can use the email name/title without requiring an API key.
         load_dotenv(Path(__file__).resolve().parent / '.env', override=False)
-        parser = argparse.ArgumentParser(description='Research a news topic with Gemini.')
+        parser = argparse.ArgumentParser(description='Research a news topic with Gemini or OpenRouter.')
         parser.add_argument('--thorough', action='store_true',
                             help='Run six separate model calls (slower and uses more quota).')
         parser.add_argument('--demo', action='store_true',
@@ -97,6 +98,8 @@ def main() -> int:
         print('Email delivery failed. Check SMTP settings and try again.', file=sys.stderr)
     except errors.APIError as error:
         _print_api_error(error)
+    except OpenRouterError as error:
+        print(f'Error: HTTP {error.code}: {error}', file=sys.stderr)
     except httpx.TimeoutException:
         print('Request timed out. Please try again.', file=sys.stderr)
     except httpx.TransportError:

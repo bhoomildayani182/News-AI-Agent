@@ -13,6 +13,7 @@ from google.genai import errors
 from config import ConfigurationError, get_settings
 from email_delivery import EmailConfigurationError, send_email, validate_email_settings
 from stages import ResearchError, research_topic
+from openrouter_client import OpenRouterError
 
 
 HOST = '127.0.0.1'
@@ -60,6 +61,8 @@ class JobState:
                 'Gemini quota or rate limit reached. No email was sent.' if code == 429
                 else 'Gemini request failed. Check model access and try again later. No email was sent.'
             )
+        except OpenRouterError as error:
+            status, message = 'failed', f'OpenRouter HTTP {error.code}: {error} No email was sent.'
         except (httpx.HTTPError, smtplib.SMTPException, OSError):
             status, message = 'failed', 'Research or email connection failed. Check your network and email settings.'
         except Exception:
@@ -101,7 +104,7 @@ small {{display:block;margin-top:18px;color:#52627b}}
 <textarea id="topic" name="topic" minlength="5" maxlength="500" required>{safe_topic}</textarea>
 <button type="submit" {'disabled' if status == 'running' else ''}>Research and send email</button>
 </form>{notice}
-<small>Runs one topic at a time. Keep this page open to see the result. Each submitted topic uses Gemini API quota.</small>
+<small>Runs one topic at a time. Keep this page open to see the result. Each submitted topic uses your selected provider's API quota.</small>
 </main></body></html>'''.encode('utf-8')
 
 

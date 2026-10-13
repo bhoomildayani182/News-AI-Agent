@@ -1,7 +1,7 @@
 # AI News Research Agent
 
-A Python command-line application that researches a news topic using Gemini and
-Google Search, explains it in plain English, and optionally emails the report.
+A Python application that researches a news topic using Gemini or OpenRouter,
+explains it in plain English, and optionally emails the report.
 
 ## How the agent works
 
@@ -51,25 +51,38 @@ python -m pip install -r requirements.txt
 If the virtual environment already exists, skip its creation. Activate it again
 whenever you open a new terminal. After activation, use `python` as shown below.
 
-## 3. Configure Gemini
+## 3. Choose an AI provider
 
 If `.env` does not exist, copy `.env.example` and name the copy `.env`.
 Do not overwrite an existing configuration.
 
-Create an API key in [Google AI Studio](https://aistudio.google.com/app/apikey),
-then edit these settings in your private `.env`:
+For Gemini, create a key in [Google AI Studio](https://aistudio.google.com/app/apikey)
+and set these lines in your private `.env`:
 
 ```dotenv
+AI_PROVIDER=gemini
 GEMINI_API_KEY=your_real_api_key_here
 GEMINI_MODEL=gemini-3.1-flash-lite
 GEMINI_REVIEW_MODEL=gemini-3.7-flash
 PREFERRED_SOURCES=RBA,ABC,Reuters,AFR
 ```
 
-The application uses the **Gemini Developer API**, not Vertex AI or OpenRouter.
-Research and drafting use `GEMINI_MODEL`; the final evidence review uses
-`GEMINI_REVIEW_MODEL`. Your Google account must have access to the configured
-models, and the research model must support Google Search.
+For OpenRouter, create a key in your [OpenRouter dashboard](https://openrouter.ai/keys)
+and set these lines instead:
+
+```dotenv
+AI_PROVIDER=openrouter
+OPENROUTER_API_KEY=your_real_openrouter_key_here
+OPENROUTER_MODEL=google/gemini-3.1-flash-lite
+OPENROUTER_REVIEW_MODEL=google/gemini-3.7-flash
+PREFERRED_SOURCES=RBA,ABC,Reuters,AFR
+```
+
+Only the selected provider's key is used. Existing `GEMINI_*` lines may remain
+in `.env` when OpenRouter is selected. Research uses the lower-cost model;
+the final review uses the stronger model. Both models must be available to
+your chosen account. OpenRouter uses its [web search server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search)
+for current sources; the tool may add search charges to model usage.
 
 Change the comma-separated `PREFERRED_SOURCES` list to your preferred publishers.
 These are preferences, not a guarantee that every publisher will appear.
@@ -83,7 +96,7 @@ Existing terminal environment variables take priority over values in `.env`.
 
 ### Use a simple local web page
 
-After setting the Gemini and email values in `.env` (see section 6), start the
+After setting the selected provider and email values in `.env` (see section 6), start the
 agent from the project folder:
 
 ```bash
@@ -97,7 +110,7 @@ cannot start overlapping reports. The configured `EMAIL_TO` address receives the
 report. Keep the terminal running while the agent works; press Ctrl+C to stop it.
 
 This page is available only on your computer. It is not a public website or a
-scheduled service. Every submission starts fresh research and uses Gemini API
+scheduled service. Every submission starts fresh research and uses provider API
 quota. You do not need to keep the page running between requests.
 
 ### Use the command line
@@ -114,7 +127,7 @@ What did the RBA announce in its most recent cash rate decision?
 
 The default mode researches, writes, and reviews the report using three model
 requests, before any retries or correction. A correction and re-review can add
-two requests. Live research uses your Google API quota and may incur charges.
+two requests. Live research uses your selected provider's quota and may incur charges.
 
 ## 5. Preview the email
 
@@ -187,7 +200,8 @@ default mode. It can also be combined with `--preview-email` or `--send-email`.
 |---|---|
 | `main.py` | Starts the agent, accepts a topic, and selects display, preview, or email delivery. |
 | `web_app.py` | Provides a local topic form and sends approved reports to `EMAIL_TO`. |
-| `config.py` | Loads the API key, models, and source preferences. |
+| `config.py` | Loads the selected provider, API key, models, and source preferences. |
+| `openrouter_client.py` | Connects OpenRouter web search and citations to the research pipeline. |
 | `stages.py` | Researches, compares evidence, writes, and validates reports. |
 | `email_format.py` | Creates the HTML email and plain-text alternative. |
 | `email_delivery.py` | Loads email settings and sends through SMTP. |
@@ -197,11 +211,14 @@ default mode. It can also be combined with `--preview-email` or `--send-email`.
 
 ## Common issues
 
-- **Missing API key:** set `GEMINI_API_KEY` in `.env`.
-- **HTTP 429:** check the Google project's quota, rate limits, and spending cap.
+- **Missing API key:** set the selected provider's API key in `.env`.
+- **HTTP 402 from OpenRouter:** add credits or check the account's billing.
+- **HTTP 429:** check the selected provider's quota, rate limits, and spending cap.
   Repeated retries will not fix an exhausted allowance.
-- **Model unavailable / access denied:** check the configured model names,
-  API key, and model access for your Google project.
+- **Model unavailable / access denied:** check the selected model names,
+  API key, and model access for your account.
+- **Few or no source links:** the web search tool may not have run or may not
+  return enough cited results; no report or email is produced.
 - **Validation failed:** no email is sent. Try a more specific question with
   clearer official coverage, then inspect the sources.
 - **Email failed:** check SMTP host, port, credentials, and allowed sender address.
