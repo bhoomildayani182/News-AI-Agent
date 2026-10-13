@@ -42,13 +42,17 @@ def _json_schema(schema):
 
 
 def _annotations(message):
-    """Use provider supplied URL citations, never URLs guessed from model prose."""
+    """Keep only source URLs accompanied by a provider supplied excerpt."""
     sources, supports, seen = [], [], set()
     for item in message.get('annotations') or []:
         if not isinstance(item, dict) or item.get('type') != 'url_citation':
             continue
         citation = item.get('url_citation') or item
         if not isinstance(citation, dict):
+            continue
+        excerpt = str(citation.get('content') or '').strip()
+        if not excerpt:
+            # A link alone cannot verify a claim in the later review stage.
             continue
         url = str(citation.get('url') or '').strip()
         try:
@@ -61,13 +65,11 @@ def _annotations(message):
             seen.add(url)
             title = str(citation.get('title') or parsed.netloc).strip()
             sources.append(SimpleNamespace(web=SimpleNamespace(uri=url, title=title)))
-        excerpt = str(citation.get('content') or '').strip()
-        if excerpt:
-            index = next(i for i, source in enumerate(sources) if source.web.uri == url)
-            supports.append(SimpleNamespace(
-                segment=SimpleNamespace(text=excerpt[:1200]),
-                grounding_chunk_indices=[index],
-            ))
+        index = next(i for i, source in enumerate(sources) if source.web.uri == url)
+        supports.append(SimpleNamespace(
+            segment=SimpleNamespace(text=excerpt[:1200]),
+            grounding_chunk_indices=[index],
+        ))
     return SimpleNamespace(grounding_chunks=sources, grounding_supports=supports)
 
 
@@ -99,8 +101,11 @@ class OpenRouterClient:
         if search:
             payload['tools'] = [{
                 'type': 'openrouter:web_search',
-                'parameters': {'engine': 'auto', 'max_results': 5,
-                               'max_total_results': 10, 'max_uses': 2},
+                # Exa returns extractive highlights in url_citation.content.
+                # Native search can provide links without reviewable excerpts.
+                'parameters': {'engine': 'exa', 'max_results': 5,
+                               'max_total_results': 10, 'max_uses': 2,
+                               'max_characters': 2000},
             }]
             payload['max_tool_calls'] = 2
         if config.response_schema:

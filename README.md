@@ -82,7 +82,9 @@ Only the selected provider's key is used. Existing `GEMINI_*` lines may remain
 in `.env` when OpenRouter is selected. Research uses the lower-cost model;
 the final review uses the stronger model. Both models must be available to
 your chosen account. OpenRouter uses its [web search server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search)
-for current sources; the tool may add search charges to model usage.
+with Exa highlights so the reviewer can check supporting text. Search charges
+are additional to model usage. If fewer than two sources return supporting text,
+the agent stops without sending email.
 
 Change the comma-separated `PREFERRED_SOURCES` list to your preferred publishers.
 These are preferences, not a guarantee that every publisher will appear.

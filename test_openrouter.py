@@ -65,6 +65,7 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(len(result.sources), 2)
         self.assertEqual(result.sources[0].url, 'https://example.org/official')
         self.assertIn('openrouter:web_search', str(calls[0].kwargs['json']['tools']))
+        self.assertEqual(calls[0].kwargs['json']['tools'][0]['parameters']['engine'], 'exa')
         self.assertNotIn('tools', calls[1].kwargs['json'])
         self.assertEqual(calls[2].kwargs['json']['model'], 'google/gemini-3.7-flash')
         self.assertEqual(calls[1].kwargs['json']['response_format']['type'], 'json_schema')
@@ -72,6 +73,16 @@ class OpenRouterTests(unittest.TestCase):
     def test_search_without_provider_citations_stops(self):
         with patch('openrouter_client.httpx.Client') as constructor:
             constructor.return_value.post.return_value = completion('Ungrounded')
+            with self.assertRaisesRegex(ResearchError, 'fewer than two'):
+                research_topic('Test topic', self.settings)
+            self.assertEqual(constructor.return_value.post.call_count, 1)
+
+    def test_url_without_excerpt_cannot_be_used_as_evidence(self):
+        annotations = [self.annotations[0],
+                       {'type': 'url_citation', 'url_citation': {
+                           'url': 'https://example.com/unread', 'title': 'Unread'}}]
+        with patch('openrouter_client.httpx.Client') as constructor:
+            constructor.return_value.post.return_value = completion('Evidence', annotations=annotations)
             with self.assertRaisesRegex(ResearchError, 'fewer than two'):
                 research_topic('Test topic', self.settings)
             self.assertEqual(constructor.return_value.post.call_count, 1)
