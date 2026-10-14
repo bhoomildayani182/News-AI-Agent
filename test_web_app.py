@@ -42,6 +42,20 @@ class WebAppTests(unittest.TestCase):
         self.assertNotIn('<unsafe>', html)
         self.assertIn('&lt;unsafe&gt;', html)
 
+    def test_research_failure_keeps_cost_and_exact_reason_visible(self):
+        error = ResearchError('Missing independent source evidence.')
+        error.run_summary = {'run_id': 'test-run', 'api_calls': 2,
+                             'reported_cost_usd': 0.002, 'cost_complete': True,
+                             'elapsed_seconds': 3, 'search_requests': 1}
+        state = JobState()
+        with patch('web_app.get_settings'), patch('web_app.validate_email_settings'), \
+             patch('web_app.research_topic', side_effect=error), \
+             patch('web_app.send_email') as send:
+            state._run('Topic')
+        self.assertIn('Missing independent', state.snapshot()[2])
+        self.assertIn('$0.002000', page(summary=state.run_summary()).decode())
+        send.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

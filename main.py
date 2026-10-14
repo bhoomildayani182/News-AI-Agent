@@ -16,6 +16,7 @@ from email_delivery import (EmailConfigurationError, build_email, send_email,
                             validate_email_settings)
 from stages import ResearchError, format_report, research_topic
 from openrouter_client import OpenRouterError
+from run_tracking import RunStore, record_delivery, usage_text
 
 
 def get_topic() -> str:
@@ -46,12 +47,17 @@ def _print_api_error(error: errors.APIError) -> None:
 
 
 def main() -> int:
+    delivery_started = False
     try:
         # Demo previews can use the email name/title without requiring an API key.
         load_dotenv(Path(__file__).resolve().parent / '.env', override=False)
         parser = argparse.ArgumentParser(description='Research a news topic with Gemini or OpenRouter.')
         parser.add_argument('--thorough', action='store_true',
-                            help='Run six separate model calls (slower and uses more quota).')
+                            help='Gemini: six stages. OpenRouter always uses its bounded research loop.')
+        parser.add_argument('--fresh', action='store_true',
+                            help='OpenRouter: bypass the recent verified-report cache.')
+        parser.add_argument('--history', action='store_true',
+                            help='Show the five most recent local OpenRouter runs without an API call.')
         parser.add_argument('--demo', action='store_true',
                             help='Show a fictional sample locally; makes zero API calls.')
         email_action = parser.add_mutually_exclusive_group()
@@ -60,6 +66,18 @@ def main() -> int:
         email_action.add_argument('--send-email', action='store_true',
                             help='Send a successful live report using SMTP settings in .env.')
         args = parser.parse_args()
+        if args.history:
+            if any((args.send_email, args.preview_email, args.demo, args.fresh, args.thorough)):
+                parser.error('--history must be used on its own.')
+            history = RunStore().recent()
+            for item in history:
+                print(usage_text(item))
+                print(f"  {item['status']} at {item['stage']}: {item.get('error') or 'OK'}")
+                if item.get('delivery_status'):
+                    print('  Email: ' + item['delivery_status'])
+            if not history:
+                print('No local OpenRouter runs yet.')
+            return 0
         if args.demo and args.send_email:
             parser.error('--demo cannot be combined with --send-email.')
         if args.demo:
@@ -71,9 +89,12 @@ def main() -> int:
             if args.send_email:
                 validate_email_settings()  # Check before paid API requests.
             topic = get_topic()
-            mode = 'six-stage' if args.thorough else 'fast'
+            mode = 'bounded' if settings.provider == 'openrouter' else ('six-stage' if args.thorough else 'fast')
             print(f'\nStarting {mode} research...\n')
-            result = research_topic(topic, settings, thorough=args.thorough)
+            if args.fresh:
+                result = research_topic(topic, settings, thorough=args.thorough, fresh=True)
+            else:
+                result = research_topic(topic, settings, thorough=args.thorough)
         if args.preview_email:
             sender = os.getenv('EMAIL_FROM', '').strip() or 'sender@example.com'
             recipient = os.getenv('EMAIL_TO', '').strip() or 'recipient@example.com'
@@ -89,13 +110,20 @@ def main() -> int:
         else:
             print('\n' + format_report(result))
         if args.send_email:
+            delivery_started = True
+            record_delivery(result.run_summary, 'sending')
             send_email(topic, result)
+            record_delivery(result.run_summary, 'accepted_by_smtp')
             print('\nEmail sent successfully.')
         return 0
     except (ConfigurationError, ResearchError, EmailConfigurationError) as error:
         print(f'Error: {error}', file=sys.stderr)
     except (smtplib.SMTPException, OSError):
-        print('Email delivery failed. Check SMTP settings and try again.', file=sys.stderr)
+        if delivery_started:
+            record_delivery(result.run_summary, 'unconfirmed_check_inbox_before_retry')
+        message = ('Email delivery could not be confirmed. Check SMTP settings and inbox before sending again.' if delivery_started
+                   else 'A local file or connection operation failed. Check network and project folder permissions.')
+        print(message, file=sys.stderr)
     except errors.APIError as error:
         _print_api_error(error)
     except OpenRouterError as error:

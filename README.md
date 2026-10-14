@@ -7,9 +7,10 @@ explains it in plain English, and optionally emails the report.
 
 1. You enter a news topic or question.
 2. The agent researches current information and collects source links.
-3. It compares the evidence and writes a short, plain-English brief.
-4. A review checks the draft against the collected evidence. A rejected draft
-   can be corrected once and reviewed again.
+3. With OpenRouter, it checks source diversity and decides whether to write or
+   search for a missing fact. Research is limited to two rounds.
+4. A reviewer checks claims against the excerpts and returns a corrected brief,
+   requests targeted evidence, or stops publication.
 5. A successful report appears in the terminal, an email preview, or an email,
    depending on the command you choose.
 
@@ -74,17 +75,25 @@ and set these lines instead:
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_real_openrouter_key_here
 OPENROUTER_MODEL=google/gemini-3.1-flash-lite
-OPENROUTER_REVIEW_MODEL=google/gemini-3.7-flash
+OPENROUTER_REVIEW_MODEL=google/gemini-3.1-flash-lite
+OPENROUTER_MAX_RUN_COST_USD=0.03
+RESEARCH_MAX_ROUNDS=2
+REPORT_CACHE_MINUTES=15
 PREFERRED_SOURCES=RBA,ABC,Reuters,AFR
 ```
 
 Only the selected provider's key is used. Existing `GEMINI_*` lines may remain
-in `.env` when OpenRouter is selected. Research uses the lower-cost model;
-the final review uses the stronger model. Both models must be available to
-your chosen account. OpenRouter uses its [web search server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search)
-with Exa highlights so the reviewer can check supporting text. Search charges
-are additional to model usage. If fewer than two sources return supporting text,
-the agent stops without sending email.
+in `.env` when OpenRouter is selected. Both tasks default to Flash-Lite to keep
+cost low; you can explicitly choose another review model. Both models must be available to
+your chosen account. Existing model values in `.env` override new defaults:
+update both model lines above if migrating from the older, more expensive setup.
+OpenRouter uses its [web search server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search)
+with Parallel's fast mode for source excerpts. Each research request permits one
+search and up to five results. Search charges are additional to model usage.
+The agent needs supporting text from two distinct publisher domains. It strips
+tracking parameters, merges duplicate links, removes identical syndicated excerpts,
+and never treats a bare URL as evidence. A domain is a diversity check, not proof
+of editorial independence. Article dates are displayed only when returned in metadata.
 
 Change the comma-separated `PREFERRED_SOURCES` list to your preferred publishers.
 These are preferences, not a guarantee that every publisher will appear.
@@ -112,8 +121,8 @@ cannot start overlapping reports. The configured `EMAIL_TO` address receives the
 report. Keep the terminal running while the agent works; press Ctrl+C to stop it.
 
 This page is available only on your computer. It is not a public website or a
-scheduled service. Every submission starts fresh research and uses provider API
-quota. You do not need to keep the page running between requests.
+scheduled service. OpenRouter reuses a recently verified report for the same
+topic and settings for 15 minutes. Keep the server running while accepting topics.
 
 ### Use the command line
 
@@ -127,9 +136,12 @@ At `Enter news topic:`, enter a question such as:
 What did the RBA announce in its most recent cash rate decision?
 ```
 
-The default mode researches, writes, and reviews the report using three model
-requests, before any retries or correction. A correction and re-review can add
-two requests. Live research uses your selected provider's quota and may incur charges.
+An OpenRouter run normally uses three model requests: search, decision/draft,
+and review. If essential evidence is missing, it can perform one targeted follow-up
+round, with at most six model requests and two search-enabled requests total.
+HTTP failures and malformed responses do not trigger automatic paid retries.
+Cached runs make no API requests. Gemini retains its original three-call mode
+and one bounded correction. Live research may incur charges.
 
 ## 5. Preview the email
 
@@ -137,7 +149,8 @@ two requests. Live research uses your selected provider's quota and may incur ch
 python main.py --preview-email
 ```
 
-Enter your topic. This runs **live research but does not send email**.
+Enter your topic. This uses a recent verified OpenRouter report if available,
+otherwise it runs **live research without sending email**.
 It prints a text preview and saves `email-preview.html` in the project folder.
 Open that file in your browser to see the formatted email.
 Each preview replaces the previous preview file.
@@ -182,9 +195,48 @@ Enter the topic. The agent checks email configuration, researches the topic,
 and sends one email only after the report passes its checks.
 Delivery still depends on your email provider.
 
-**Each live command starts fresh research.** Running `--send-email` after a
-preview does not send the saved preview; it generates a new report and uses
-API quota again. Preview and send options cannot be combined.
+With OpenRouter, repeating the exact topic and settings within the cache period
+reuses the verified report. You can preview, inspect it, and then use `--send-email`
+without paying for another research run. Each explicit send command still sends
+an email; do not repeat it unless you want another copy. Preview and send options
+cannot be combined. Use `--fresh` to deliberately research again:
+
+```bash
+python main.py --preview-email --fresh
+```
+
+The cache is scoped by topic, UTC date, provider, models, key fingerprint and
+source preferences. Failed reports are never cached. Set `REPORT_CACHE_MINUTES=0`
+to disable it. Emails show the original research timestamp.
+
+## Cost controls and run history
+
+OpenRouter checks published model prices before a paid request, caps output
+tokens, disables the old account-level web plugin on writing/review requests,
+and checks estimated spending against `OPENROUTER_MAX_RUN_COST_USD`. Requests
+stop if the next estimate would exceed the configured budget.
+
+This is an application budget guard, not a guaranteed billing cap: estimates
+and search prices can differ from final charges, and in-flight costs cannot
+be undone. For a provider-enforced limit, also set a spending limit on your
+[OpenRouter API key](https://openrouter.ai/keys). The default budget is $0.03 USD,
+not a promised price for a report. The application does not raise account limits.
+
+The terminal and web result show API calls, elapsed time, provider-reported cost,
+and reported searches. Missing usage is explicitly marked unavailable, never
+assumed to be free. Counts describe application requests; OpenRouter may perform
+internal model steps while executing its search tool.
+
+View the latest five research runs without API calls:
+
+```bash
+python main.py --history
+```
+
+The local `.agent-data/runs.sqlite3` contains research stages, decisions, failures,
+usage and cached reports. It is ignored by Git. Keys and raw API responses are
+not logged. Email acceptance is recorded separately from research; an SMTP success message means the
+mail server accepted the email, not that inbox delivery has been independently verified.
 
 ## Optional: more detailed research
 
@@ -192,9 +244,9 @@ API quota again. Preview and send options cannot be combined.
 python main.py --thorough
 ```
 
-This separates planning, research, source evaluation, comparison, writing, and
-review into six model requests. It is slower and uses more quota than the
-default mode. It can also be combined with `--preview-email` or `--send-email`.
+For Gemini, this separates the six research stages and costs more than its
+default mode. OpenRouter always uses the bounded loop above, including when
+`--thorough` is supplied. Neither mode has unlimited autonomous research.
 
 ## Main project files
 
@@ -203,7 +255,9 @@ default mode. It can also be combined with `--preview-email` or `--send-email`.
 | `main.py` | Starts the agent, accepts a topic, and selects display, preview, or email delivery. |
 | `web_app.py` | Provides a local topic form and sends approved reports to `EMAIL_TO`. |
 | `config.py` | Loads the selected provider, API key, models, and source preferences. |
-| `openrouter_client.py` | Connects OpenRouter web search and citations to the research pipeline. |
+| `openrouter_client.py` | Bounds requests, checks prices, and collects OpenRouter usage. |
+| `research_agent.py` | Runs the bounded OpenRouter research decision loop and source checks. |
+| `run_tracking.py` | Stores local research history and recent verified reports. |
 | `stages.py` | Researches, compares evidence, writes, and validates reports. |
 | `email_format.py` | Creates the HTML email and plain-text alternative. |
 | `email_delivery.py` | Loads email settings and sends through SMTP. |
@@ -220,7 +274,11 @@ default mode. It can also be combined with `--preview-email` or `--send-email`.
 - **Model unavailable / access denied:** check the selected model names,
   API key, and model access for your account.
 - **Few or no source links:** the web search tool may not have run or may not
-  return enough cited results; no report or email is produced.
+  return enough excerpts from different publishers; the agent makes at most one
+  targeted follow-up before stopping without email.
+- **Budget guard stopped:** inspect `--history` before increasing the budget.
+- **Incomplete provider response:** inspect the finish reason in local history;
+  no automatic paid retry is made.
 - **Validation failed:** no email is sent. Try a more specific question with
   clearer official coverage, then inspect the sources.
 - **Email failed:** check SMTP host, port, credentials, and allowed sender address.

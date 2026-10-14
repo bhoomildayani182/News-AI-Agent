@@ -1,6 +1,7 @@
 """Application configuration loaded from environment variables."""
 
 from dataclasses import dataclass, field
+import math
 import os
 from pathlib import Path
 
@@ -24,6 +25,9 @@ class Settings:
     preferred_sources: tuple[str, ...] = ()
     review_model: str = ''
     provider: str = 'gemini'
+    max_run_cost_usd: float = 0.03
+    max_research_rounds: int = 2
+    cache_minutes: int = 15
 
 
 def get_settings(*, require_api_key: bool = True) -> Settings:
@@ -40,12 +44,12 @@ def get_settings(*, require_api_key: bool = True) -> Settings:
     api_key = os.getenv(key_name, '').strip()
     if require_api_key and (
         not api_key or api_key in {'replace_with_your_api_key', 'your_real_api_key_here',
-                                   'your_openrouter_key_here'}
+                                   'your_openrouter_key_here', 'your_real_openrouter_key_here'}
     ):
         raise ConfigurationError(f'{key_name} is not set in .env.')
     if provider == 'openrouter':
         model = os.getenv('OPENROUTER_MODEL', DEFAULT_OPENROUTER_MODEL).strip() or DEFAULT_OPENROUTER_MODEL
-        review_model = os.getenv('OPENROUTER_REVIEW_MODEL', 'google/gemini-3.7-flash').strip() or model
+        review_model = os.getenv('OPENROUTER_REVIEW_MODEL', 'google/gemini-3.1-flash-lite').strip() or model
     else:
         model = os.getenv('GEMINI_MODEL', DEFAULT_MODEL).strip() or DEFAULT_MODEL
         review_model = os.getenv('GEMINI_REVIEW_MODEL', 'gemini-3.7-flash').strip() or model
@@ -53,5 +57,18 @@ def get_settings(*, require_api_key: bool = True) -> Settings:
         source.strip() for source in os.getenv('PREFERRED_SOURCES', 'RBA,ABC,Reuters,AFR').split(',')
         if source.strip()
     ))
+    try:
+        budget = float(os.getenv('OPENROUTER_MAX_RUN_COST_USD', '0.03'))
+        rounds = int(os.getenv('RESEARCH_MAX_ROUNDS', '2'))
+        cache_minutes = int(os.getenv('REPORT_CACHE_MINUTES', '15'))
+        if not math.isfinite(budget) or not 0 < budget <= 1:
+            raise ValueError()
+        if not 1 <= rounds <= 2 or not 0 <= cache_minutes <= 60:
+            raise ValueError()
+    except ValueError:
+        raise ConfigurationError('Use a positive budget up to $1, 1–2 research rounds, '
+                                 'and 0–60 cache minutes.') from None
     return Settings(api_key=api_key, model=model, preferred_sources=preferred,
-                    review_model=review_model, provider=provider)
+                    review_model=review_model, provider=provider,
+                    max_run_cost_usd=budget, max_research_rounds=rounds,
+                    cache_minutes=cache_minutes)

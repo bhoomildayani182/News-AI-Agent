@@ -74,7 +74,12 @@ def html_email(topic: str, result: ResearchResult, title: str) -> str:
     sources = ''.join(
         f'<p style="margin:0 0 7px"><a href="{urls[n]}" '
         f'style="color:#2563eb;text-decoration:underline">[{n}] '
-        f'{escape(result.sources[n - 1].title)}</a></p>' for n in sorted(cited))
+        f'{escape(result.sources[n - 1].title)}</a>'
+        + (f' <span style="color:#64748b">({escape(result.sources[n - 1].published_at)})</span>'
+           if result.sources[n - 1].published_at else '') + '</p>' for n in sorted(cited))
+    generated = result.run_summary.get('report_generated_at', '')
+    researched = (f'<p style="font-size:12px;color:#64748b">Researched: {escape(generated)}</p>'
+                  if generated else '')
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>{escape(title)}</title></head>'
@@ -92,4 +97,5 @@ def html_email(topic: str, result: ResearchResult, title: str) -> str:
             '<tr><td style="padding:20px 28px;background:#f8fafc;border-top:1px solid #e2e8f0">'
             '<h2 style="font-size:15px;margin:0 0 10px;color:#0f172a">Read the sources</h2>' + sources +
             '<p style="font-size:12px;color:#64748b;margin:16px 0 0">AI-assisted research. '
-            'Source links let you check the original reporting.</p></td></tr></table></td></tr></table></body></html>')
+            'Source links let you check the original reporting.</p>' + researched +
+            '</td></tr></table></td></tr></table></body></html>')

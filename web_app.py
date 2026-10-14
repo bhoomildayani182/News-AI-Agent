@@ -14,6 +14,7 @@ from config import ConfigurationError, get_settings
 from email_delivery import EmailConfigurationError, send_email, validate_email_settings
 from stages import ResearchError, research_topic
 from openrouter_client import OpenRouterError
+from run_tracking import record_delivery, usage_text
 
 
 HOST = '127.0.0.1'
@@ -30,6 +31,7 @@ class JobState:
         self.topic = ''
         self.status = 'idle'
         self.message = ''
+        self.summary = {}
 
     def snapshot(self):
         with self.lock:
@@ -40,21 +42,40 @@ class JobState:
             if self.status == 'running':
                 return False
             self.topic = topic
+            self.summary = {}
             self.status = 'running'
             self.message = 'Researching sources and preparing your email. This can take a few minutes.'
         Thread(target=self._run, args=(topic,), daemon=True).start()
         return True
 
+    def progress(self, message):
+        with self.lock:
+            self.message = message
+
+    def run_summary(self):
+        with self.lock:
+            return dict(self.summary)
+
     def _run(self, topic):
+        summary = {}
+        delivery_started = False
         try:
             settings = get_settings()
             validate_email_settings()
-            result = research_topic(topic, settings)
+            if settings.provider == 'openrouter':
+                result = research_topic(topic, settings, on_progress=self.progress)
+            else:
+                result = research_topic(topic, settings)
+            summary = getattr(result, 'run_summary', {})
+            delivery_started = True
+            record_delivery(summary, 'sending')
             send_email(topic, result)
+            record_delivery(summary, 'accepted_by_smtp')
         except (ConfigurationError, EmailConfigurationError) as error:
             status, message = 'failed', str(error)
-        except ResearchError:
-            status, message = 'failed', 'The report did not pass research checks. No email was sent.'
+        except ResearchError as error:
+            summary = getattr(error, 'run_summary', {})
+            status, message = 'failed', str(error)[:600] + ' No email was sent.'
         except errors.APIError as error:
             code = getattr(error, 'code', None)
             status, message = 'failed', (
@@ -62,27 +83,36 @@ class JobState:
                 else 'Gemini request failed. Check model access and try again later. No email was sent.'
             )
         except OpenRouterError as error:
+            summary = getattr(error, 'run_summary', {})
             status, message = 'failed', f'OpenRouter HTTP {error.code}: {error} No email was sent.'
-        except (httpx.HTTPError, smtplib.SMTPException, OSError):
-            status, message = 'failed', 'Research or email connection failed. Check your network and email settings.'
-        except Exception:
+        except (httpx.HTTPError, smtplib.SMTPException, OSError) as error:
+            summary = getattr(error, 'run_summary', summary)
+            if delivery_started:
+                record_delivery(summary, 'unconfirmed_check_inbox_before_retry')
+            status, message = 'failed', ('Email delivery could not be confirmed. Check your inbox before retrying.'
+                if delivery_started else 'Research connection failed. Check your network; no automatic paid retry was made.')
+        except Exception as error:
+            summary = getattr(error, 'run_summary', summary)
             status, message = 'failed', 'The run failed unexpectedly. No success confirmation is available.'
         else:
             status, message = 'sent', 'Report completed and email sent to the address in EMAIL_TO.'
         with self.lock:
             self.status, self.message = status, message
+            self.summary = summary
         print(message, flush=True)
 
 
 STATE = JobState()
 
 
-def page(topic='', status='idle', message='', *, error=''):
+def page(topic='', status='idle', message='', *, error='', summary=None):
     """Render only escaped user content; the page remains local to this computer."""
     safe_topic = escape(topic, quote=True)
     notice = f'<p class="notice {status}">{escape(message)}</p>' if message else ''
     if error:
         notice = f'<p class="notice failed">{escape(error)}</p>'
+    if summary:
+        notice += f'<p class="notice">{escape(usage_text(summary))}</p>'
     refresh = '<meta http-equiv="refresh" content="4;url=/status">' if status == 'running' else ''
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -104,7 +134,7 @@ small {{display:block;margin-top:18px;color:#52627b}}
 <textarea id="topic" name="topic" minlength="5" maxlength="500" required>{safe_topic}</textarea>
 <button type="submit" {'disabled' if status == 'running' else ''}>Research and send email</button>
 </form>{notice}
-<small>Runs one topic at a time. Keep this page open to see the result. Each submitted topic uses your selected provider's API quota.</small>
+<small>Runs one topic at a time. Keep this page open to see the result. Recent verified reports may be reused; new research uses API credits.</small>
 </main></body></html>'''.encode('utf-8')
 
 
@@ -124,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
             self._respond(404, page(error='Page not found.'))
             return
         topic, status, message = STATE.snapshot()
-        self._respond(200, page(topic, status, message))
+        self._respond(200, page(topic, status, message, summary=STATE.run_summary()))
 
     def do_POST(self):
         if self.path != '/run':

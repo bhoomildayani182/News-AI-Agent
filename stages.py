@@ -1,6 +1,6 @@
 """Six research stages with fast and thorough execution modes."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import date
 import json
 import re
@@ -10,7 +10,6 @@ from google import genai
 from google.genai import types
 
 from config import Settings
-from openrouter_client import OpenRouterClient
 
 
 HEADINGS = (
@@ -46,12 +45,15 @@ class ReviewRejected(ResearchError):
 class Source:
     title: str
     url: str
+    publisher: str = ''
+    published_at: str = ''
 
 
 @dataclass(frozen=True)
 class ResearchResult:
     report_text: str
     sources: list[Source]
+    run_summary: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -329,12 +331,15 @@ def cited_source_numbers(report_text: str) -> set[int]:
     return citations
 
 
-def research_topic(topic: str, settings: Settings, *, thorough: bool = False) -> ResearchResult:
+def research_topic(topic: str, settings: Settings, *, thorough: bool = False,
+                   fresh: bool = False, on_progress=None) -> ResearchResult:
     """Run a three-call fast pipeline or the six-call thorough pipeline."""
-    client_context = (OpenRouterClient(settings.api_key) if settings.provider == 'openrouter'
-        else genai.Client(api_key=settings.api_key, vertexai=False,
+    if settings.provider == 'openrouter':
+        from research_agent import run_openrouter
+        return run_openrouter(topic, settings, fresh=fresh, on_progress=on_progress)
+    client_context = genai.Client(api_key=settings.api_key, vertexai=False,
                           http_options=types.HttpOptions(timeout=60_000,
-                              retry_options=types.HttpRetryOptions(attempts=2))))
+                              retry_options=types.HttpRetryOptions(attempts=2)))
     with client_context as client:
         if thorough:
             print('[1/6] Research planning', flush=True)
@@ -378,5 +383,6 @@ def format_report(result: ResearchResult) -> str:
     lines = ['## Sources']
     for i, source in enumerate(result.sources, 1):
         if i in citations:
-            lines.append(f'[S{i}] {source.title}\n{source.url}')
+            published = f' ({source.published_at})' if source.published_at else ''
+            lines.append(f'[S{i}] {source.title}{published}\n{source.url}')
     return result.report_text + '\n\n' + '\n\n'.join(lines)
