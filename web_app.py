@@ -2,6 +2,7 @@
 
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import os
 from secrets import token_urlsafe
 import smtplib
 from threading import Lock, Thread
@@ -75,7 +76,9 @@ class JobState:
             status, message = 'failed', str(error)
         except ResearchError as error:
             summary = getattr(error, 'run_summary', {})
-            status, message = 'failed', str(error)[:600] + ' No email was sent.'
+            detail = str(error).replace(' No report or email produced.', '')[:600]
+            status, message = 'failed', ('Research stopped safely: ' + detail +
+                                         ' No email was sent. The app is still running.')
         except errors.APIError as error:
             code = getattr(error, 'code', None)
             status, message = 'failed', (
@@ -199,8 +202,14 @@ def main():
     except (ConfigurationError, EmailConfigurationError) as error:
         print(f'Setup error: {error}')
         return 1
+    # Container networking needs all container interfaces, but browser Host/Origin
+    # checks above still use the fixed loopback URL. Compose publishes loopback only.
+    bind_host = os.getenv('APP_BIND_HOST', HOST).strip() or HOST
+    if bind_host not in {HOST, '0.0.0.0'}:
+        print('Setup error: APP_BIND_HOST must be 127.0.0.1 or 0.0.0.0.')
+        return 1
     try:
-        server = ThreadingHTTPServer((HOST, PORT), Handler)
+        server = ThreadingHTTPServer((bind_host, PORT), Handler)
     except OSError:
         print(f'Cannot start the local page on {HOST}:{PORT}. Check whether the port is in use.')
         return 1

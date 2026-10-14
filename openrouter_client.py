@@ -71,8 +71,15 @@ class OpenRouterClient:
         return rates
 
     def complete(self, stage, model, system, data, *, schema=None, search=False):
-        if len(self.log.calls) >= self.settings.max_research_rounds * 3:
+        # One final evidence-only repair is allowed, never an extra web search.
+        if stage == 'repair' and (search or any(c['stage'] == 'repair' for c in self.log.calls)):
+            raise BudgetExceeded('Only one evidence-only repair request is allowed.')
+        normal_calls = sum(c['stage'] != 'repair' for c in self.log.calls)
+        if (normal_calls >= self.settings.max_research_rounds * 3 and stage != 'repair') or (
+                len(self.log.calls) >= self.settings.max_research_rounds * 3 + 1):
             raise BudgetExceeded('Maximum API calls reached; stopped further spending.')
+        if search and sum(c['search_enabled'] for c in self.log.calls) >= self.settings.max_research_rounds:
+            raise BudgetExceeded('Maximum search rounds reached; stopped further spending.')
         input_rate, output_rate = self._pricing(model)
         user_text = json.dumps(data, ensure_ascii=False)
         if len(user_text.encode()) > 45000:

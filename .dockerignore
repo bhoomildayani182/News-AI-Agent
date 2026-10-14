@@ -1,0 +1,16 @@
+# Deny by default: only runtime source and requirements enter the build context.
+*
+!Dockerfile
+!.dockerignore
+!requirements.txt
+!config.py
+!demo.py
+!email_delivery.py
+!email_format.py
+!main.py
+!official_sources.py
+!openrouter_client.py
+!research_agent.py
+!run_tracking.py
+!stages.py
+!web_app.py

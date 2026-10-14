@@ -7,10 +7,16 @@ explains it in plain English, and optionally emails the report.
 
 1. You enter a news topic or question.
 2. The agent researches current information and collects source links.
-3. With OpenRouter, it checks source diversity and decides whether to write or
+3. With OpenRouter, it checks source diversity and same-story relevance, and decides whether to write or
    search for a missing fact. Research is limited to two rounds.
-4. A reviewer checks claims against the excerpts and returns a corrected brief,
-   requests targeted evidence, or stops publication.
+4. A reviewer checks claims against the excerpts, explicitly assesses each cited
+   source's relevance to the event, country and period, and returns a corrected brief,
+   requests targeted evidence, or stops publication. If the final output has an
+   invalid citation or missing relevance check, one evidence-only repair attempt
+   is allowed within the same spending guard. It cannot reuse a source already
+   rejected as irrelevant or bypass the final checks.
+   The reviewer also checks that the report answers every requested part—for
+   example, the RBA's stated reasons, not merely the effects on mortgage holders.
 5. A successful report appears in the terminal, an email preview, or an email,
    depending on the command you choose.
 
@@ -19,19 +25,125 @@ Reports contain **Summary**, **In simple terms**, **Why it matters**,
 The brief targets 180–240 words, with a 300-word limit excluding the source list.
 Emails include a formatted HTML version and a plain-text alternative.
 
-The agent requires multiple source links, but AI review does not guarantee
+With OpenRouter, the agent chooses an evidence policy for the question. Factual
+summaries of an official report, statistical release, policy decision or product
+announcement may use the original official issuer alone **only when its excerpts answer the question**.
+A single-publisher report is visibly labelled in the terminal and both email formats:
+"This brief relies on one official publisher. Independent corroboration is not included."
+The official-domain check is a safeguard, not proof of relevance or accuracy;
+the model must also assess issuer identity, actual findings and question coverage.
+This exception covers `.gov.au`, `.gov`, `.gov.uk` and `.govt.nz` sources, plus
+explicit first-party documentation/news hosts for Google Cloud (`cloud.google.com`,
+`docs.cloud.google.com`, `developers.google.com`), AWS (`aws.amazon.com`,
+`docs.aws.amazon.com`) and Microsoft (`learn.microsoft.com`, `docs.microsoft.com`,
+`azure.microsoft.com`). Matching is by exact vendor hostname, not a loose substring.
+Unknown commercial websites and user-hosted pages do not qualify automatically.
+Vendor documentation describes the vendor's claims; it is not independent verification.
+For latest product changes, the agent asks for dated release notes/announcements,
+not an undated documentation page. Comparisons, disputed claims and
+independent verification still require two relevant publishers covering the same story—not
+unrelated articles that merely share a keyword. For example, UK inflation data
+cannot substitute for another source covering an Australian ABS release unless
+you asked for an international comparison. When evidence remains insufficient
+after the bounded follow-up, the agent stops without sending an email.
+For statistical releases, it asks for relevant headline/underlying context and
+keeps release dates, reference periods and annual/monthly changes distinct.
+Delivered citations are numbered consecutively, with matching links in the
+HTML email, plain-text email and terminal report. Internal research IDs remain intact.
+
+AI review does not guarantee
 accuracy or independent sources. Check important claims against the linked
 articles before relying on them.
 
-## 1. Open the project folder
+## Start here: choose Docker or Python
 
-Install Python 3 and open a terminal in the folder containing `main.py` and
+Both options run the same local web agent at `http://127.0.0.1:8765`.
+Use only one option at a time so they do not compete for the same port.
+Keep the project anywhere; run commands from the folder containing `compose.yaml`
+and `main.py`.
+
+### Option A — Docker (no local Python installation needed)
+
+1. Install Docker Desktop on macOS/Windows, or Docker Engine with the Compose
+   plugin on Linux. Start Docker before running the command below. Use a current
+   Docker Compose version supporting `--wait`.
+2. If `.env` does not exist, copy `.env.example` to `.env`. Fill in your AI provider
+   key and the SMTP/email settings described below. Do not overwrite an existing `.env`.
+3. Start the agent with **one command**:
+
+```bash
+docker compose up --build --wait
+```
+
+The first run downloads Python and installs dependencies inside the image.
+The command waits for the local page to be healthy and leaves the container running
+in the background. Open **http://127.0.0.1:8765**, enter a topic and click
+**Research and send email**. Use this exact address, not `0.0.0.0` or `localhost`.
+Starting the container or its health check does not perform paid research or send email.
+Submitting a topic can incur AI/search charges and sends email only after successful validation.
+
+View status/logs:
+
+```bash
+docker compose ps
+docker compose logs --tail=100 agent
+```
+
+Stop the agent without deleting its saved history/cache:
+
+```bash
+docker compose down
+```
+
+After changing `.env`, recreate the container to load the new settings:
+
+```bash
+docker compose up --build --force-recreate --wait
+```
+
+The image runs as a non-root user. API keys/passwords are supplied at runtime from
+`.env`; that file is excluded from the image and build context. Docker administrators
+can inspect container environment variables, so keep Docker access and `.env` private.
+The web port is published only on your own computer, not your LAN or the internet.
+This is not a public production hosting configuration.
+
+Research history/cache is stored in the named `agent-data` Docker volume. It is
+separate from a Python installation's local `.agent-data` folder and survives
+ordinary container recreation. **Do not use `docker compose down -v` unless you
+intend to permanently delete the Docker history/cache.** Do not stop/recreate the
+container during active research; in-progress work is not resumed automatically.
+
+Optional CLI report/history commands inside Docker:
+
+```bash
+docker compose exec agent python main.py
+docker compose exec agent python main.py --history
+```
+
+The container's application filesystem is read-only. `--preview-email` writes an
+HTML file, so use the Python option below for that preview command. Normal web
+email delivery and terminal reports work without writing an HTML preview file.
+
+### Option B — Without Docker (local Python)
+
+Follow the Python setup and provider/email configuration below. Once configured,
+activate your virtual environment and start the web agent with:
+
+```bash
+python web_app.py
+```
+
+Open **http://127.0.0.1:8765**. Keep the terminal open; press Ctrl+C to stop.
+
+## 1. Open the project folder (Python option)
+
+Install Python 3.10 or newer and open a terminal in the folder containing `main.py` and
 `requirements.txt`. Run all commands below from that folder.
 
 **There is no fixed installation path.** You can store the project anywhere.
 Keep `.env` beside `main.py`; the application finds it there.
 
-## 2. Set up Python
+## 2. Set up Python (skip for Docker)
 
 ### macOS / Linux
 
@@ -90,10 +202,19 @@ update both model lines above if migrating from the older, more expensive setup.
 OpenRouter uses its [web search server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search)
 with Parallel's fast mode for source excerpts. Each research request permits one
 search and up to five results. Search charges are additional to model usage.
-The agent needs supporting text from two distinct publisher domains. It strips
+The agent checks evidence sufficiency before proceeding to review. Missing core
+findings trigger targeted research, not a review of a knowingly incomplete draft.
+It prefers multiple relevant publishers, with the official-primary exception above. It strips
 tracking parameters, merges duplicate links, removes identical syndicated excerpts,
 and never treats a bare URL as evidence. A domain is a diversity check, not proof
 of editorial independence. Article dates are displayed only when returned in metadata.
+For supported official HTML pages, the agent also attempts a direct read of the
+original page before drafting. Retrieval uses an exact-host allowlist, HTTPS-only
+redirects to that allowlist, a four-MiB page-size limit, per-request timeouts and
+at most two page attempts per research round. It adds no LLM request, but can add
+latency and evidence tokens. If retrieval is unavailable, the search excerpts
+remain available and the failed fetch is recorded in local run history.
+Regional Google documentation is treated as one publisher, not independent voices.
 
 Change the comma-separated `PREFERRED_SOURCES` list to your preferred publishers.
 These are preferences, not a guarantee that every publisher will appear.
@@ -121,8 +242,10 @@ cannot start overlapping reports. The configured `EMAIL_TO` address receives the
 report. Keep the terminal running while the agent works; press Ctrl+C to stop it.
 
 This page is available only on your computer. It is not a public website or a
-scheduled service. OpenRouter reuses a recently verified report for the same
-topic and settings for 15 minutes. Keep the server running while accepting topics.
+scheduled service. OpenRouter may reuse a recently verified report for a dated,
+non-time-sensitive question within the configured cache period. Questions containing
+"latest", "most recent", "current", "today", "tonight", "now" or "breaking" always
+perform fresh research. Keep the server running while accepting topics.
 
 ### Use the command line
 
@@ -138,8 +261,11 @@ What did the RBA announce in its most recent cash rate decision?
 
 An OpenRouter run normally uses three model requests: search, decision/draft,
 and review. If essential evidence is missing, it can perform one targeted follow-up
-round, with at most six model requests and two search-enabled requests total.
-HTTP failures and malformed responses do not trigger automatic paid retries.
+round, with at most six normal model requests and two search-enabled requests total.
+One additional evidence-only repair is permitted for final validation problems
+(at most seven calls total with two rounds). It makes no new search, respects the
+same run budget, and cannot relabel a rejected source to force success.
+HTTP failures and malformed JSON responses do not trigger automatic paid retries.
 Cached runs make no API requests. Gemini retains its original three-call mode
 and one bounded correction. Live research may incur charges.
 
@@ -208,6 +334,8 @@ python main.py --preview-email --fresh
 The cache is scoped by topic, UTC date, provider, models, key fingerprint and
 source preferences. Failed reports are never cached. Set `REPORT_CACHE_MINUTES=0`
 to disable it. Emails show the original research timestamp.
+Explicitly time-sensitive questions bypass this cache automatically, even when
+`REPORT_CACHE_MINUTES` is greater than zero. Fresh research incurs normal charges.
 
 ## Cost controls and run history
 
@@ -274,7 +402,7 @@ default mode. OpenRouter always uses the bounded loop above, including when
 - **Model unavailable / access denied:** check the selected model names,
   API key, and model access for your account.
 - **Few or no source links:** the web search tool may not have run or may not
-  return enough excerpts from different publishers; the agent makes at most one
+  return actual findings or sufficient relevant evidence; the agent makes at most one
   targeted follow-up before stopping without email.
 - **Budget guard stopped:** inspect `--history` before increasing the budget.
 - **Incomplete provider response:** inspect the finish reason in local history;

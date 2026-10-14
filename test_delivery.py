@@ -10,7 +10,7 @@ from demo import DEMO_TOPIC, demo_result
 from email_delivery import EmailConfigurationError, build_email, send_email
 from main import main
 from stages import ResearchError, ResearchResult, Source
-from email_format import html_email
+from email_format import html_email, plain_email
 
 
 class DeliveryTests(unittest.TestCase):
@@ -83,6 +83,22 @@ class DeliveryTests(unittest.TestCase):
         with patch.dict(os.environ, {'EMAIL_SENDER_NAME': 'Name\nInjected'}):
             with self.assertRaises(EmailConfigurationError):
                 build_email(DEMO_TOPIC, demo_result(), 'sender@example.com', 'to@example.com')
+
+    def test_sparse_grouped_citations_use_matching_consecutive_numbers(self):
+        result = ResearchResult('## Summary\nOfficial [S1]. Comparison [S4, S1].',
+                                [Source(f'Article {i}', f'https://example.org/{i}')
+                                 for i in range(1, 5)])
+        html = html_email('Topic', result, 'News')
+        plain = plain_email(result)
+        self.assertIn('href="https://example.org/4"', html)
+        self.assertIn('[2] Article 4', html)
+        self.assertNotIn('[4]', html)
+        self.assertNotIn('https://example.org/2', html)
+        self.assertIn('Comparison [S2, S1]', plain)
+        self.assertIn('[S2] Article 4\nhttps://example.org/4', plain)
+        self.assertIn('[S4, S1]', result.report_text)  # No mutation of internal evidence IDs.
+        self.assertEqual(len(result.sources), 4)
+        self.assertEqual(html, html_email('Topic', result, 'News'))
 
     def test_send_requires_settings_before_connection(self):
         with patch.dict(os.environ, {'SMTP_HOST': '', 'SMTP_USERNAME': '',

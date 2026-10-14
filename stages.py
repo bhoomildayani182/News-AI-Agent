@@ -302,7 +302,7 @@ def review_and_revise(client, settings, topic, evidence, evaluation, comparison,
         return draft
 
 
-def validate_structure(evidence, draft):
+def validate_structure(evidence, draft, *, minimum_sources=2):
     """Local checks shared by fast and thorough modes; no API request."""
     sections = re.findall(r'^#{1,2} (.+?)\s*$', draft, re.MULTILINE)
     if sections != list(HEADINGS):
@@ -316,7 +316,7 @@ def validate_structure(evidence, draft):
     valid = set(range(1, len(evidence.sources) + 1))
     if not citations or not citations <= valid or re.search(r'https?://', draft):
         raise ResearchError('Validation: missing/unknown source references or model-written URLs.')
-    if len(citations) < 2:
+    if len(citations) < minimum_sources:
         raise ResearchError('Validation: the report must use at least two source links.')
 
 
@@ -375,12 +375,40 @@ def research_topic(topic: str, settings: Settings, *, thorough: bool = False,
     return ResearchResult(draft, evidence.sources)
 
 
+def compact_sources(result: ResearchResult) -> ResearchResult:
+    """Keep internal research IDs intact; renumber only the delivered copy consistently."""
+    citations = cited_source_numbers(result.report_text)
+    if not citations <= set(range(1, len(result.sources) + 1)):
+        raise ResearchError('Validation: report cites a source that has no URL.')
+    ordered = sorted(citations)
+    numbers = {old: new for new, old in enumerate(ordered, 1)}
+
+    def renumber(match):
+        return '[' + ', '.join(f'S{numbers[int(n)]}' for n in
+                               re.findall(r'S(\d+)', match.group())) + ']'
+
+    return replace(result, report_text=SOURCE_CITATION.sub(renumber, result.report_text),
+                   sources=[result.sources[n - 1] for n in ordered])
+
+
+def source_note(result: ResearchResult) -> str:
+    """Disclose limited corroboration without claiming an independent search succeeded."""
+    if (result.run_summary.get('evidence_mode') == 'official_primary'
+            and result.run_summary.get('single_publisher') is True):
+        return ('This brief relies on one official publisher. '
+                'Independent corroboration is not included.')
+    return ''
+
+
 def format_report(result: ResearchResult) -> str:
+    result = compact_sources(result)
     # Source IDs match the citations in the report, including after URL deduplication.
     citations = cited_source_numbers(result.report_text)
     if not citations <= set(range(1, len(result.sources) + 1)):
         raise ResearchError('Validation: report cites a source that has no URL.')
     lines = ['## Sources']
+    if source_note(result):
+        lines.append('Source note: ' + source_note(result))
     for i, source in enumerate(result.sources, 1):
         if i in citations:
             published = f' ({source.published_at})' if source.published_at else ''

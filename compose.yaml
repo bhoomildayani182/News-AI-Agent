@@ -1,0 +1,24 @@
+services:
+  agent:
+    build: .
+    image: ai-news-agent:local
+    init: true
+    env_file:
+      - .env
+    environment:
+      APP_BIND_HOST: 0.0.0.0
+    ports:
+      # Keep this unauthenticated local tool off the public network.
+      - "127.0.0.1:8765:8765"
+    volumes:
+      - agent-data:/app/.agent-data
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  agent-data:

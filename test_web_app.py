@@ -1,13 +1,52 @@
 """Offline checks for the on-demand topic and email workflow."""
 
+import contextlib
+import io
+import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from stages import ResearchError
-from web_app import JobState, page
+from web_app import HOST, PORT, Handler, JobState, main, page
 
 
 class WebAppTests(unittest.TestCase):
+    def test_container_binds_all_interfaces_but_advertises_local_browser_url(self):
+        output = io.StringIO()
+        with patch.dict(os.environ, {'APP_BIND_HOST': '0.0.0.0'}), \
+             patch('web_app.get_settings'), patch('web_app.validate_email_settings'), \
+             patch('web_app.ThreadingHTTPServer') as server, contextlib.redirect_stdout(output):
+            self.assertEqual(main(), 0)
+        server.assert_called_once_with(('0.0.0.0', PORT), Handler)
+        self.assertIn('http://127.0.0.1:8765', output.getvalue())
+
+    def test_python_default_bind_remains_loopback(self):
+        with patch.dict(os.environ, {'APP_BIND_HOST': ''}), \
+             patch('web_app.get_settings'), patch('web_app.validate_email_settings'), \
+             patch('web_app.ThreadingHTTPServer') as server, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(), 0)
+        server.assert_called_once_with((HOST, PORT), Handler)
+
+    def test_invalid_bind_setting_does_not_start_server(self):
+        with patch.dict(os.environ, {'APP_BIND_HOST': 'unexpected-host'}), \
+             patch('web_app.get_settings'), patch('web_app.validate_email_settings'), \
+             patch('web_app.ThreadingHTTPServer') as server, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(), 1)
+        server.assert_not_called()
+
+    def test_container_bind_does_not_relax_browser_host_and_origin_checks(self):
+        for headers in ({'Host': 'attacker.example', 'Origin': f'http://{HOST}:{PORT}'},
+                        {'Host': f'{HOST}:{PORT}', 'Origin': 'http://attacker.example'},
+                        {'Host': f'0.0.0.0:{PORT}', 'Origin': f'http://0.0.0.0:{PORT}'}):
+            handler = Handler.__new__(Handler)
+            handler.path = '/run'
+            handler.headers = headers
+            handler._respond = Mock()
+            with patch.dict(os.environ, {'APP_BIND_HOST': '0.0.0.0'}), patch('web_app.STATE.start') as start:
+                handler.do_POST()
+            self.assertEqual(handler._respond.call_args.args[0], 403)
+            start.assert_not_called()
+
     def test_success_researches_and_sends_one_email(self):
         state = JobState()
         with patch('web_app.get_settings') as settings, \

@@ -4,7 +4,7 @@ from html import escape
 import re
 from urllib.parse import urlsplit
 
-from stages import ResearchResult, SOURCE_CITATION, cited_source_numbers, format_report
+from stages import ResearchResult, SOURCE_CITATION, cited_source_numbers, compact_sources, format_report, source_note
 
 
 def plain_email(result: ResearchResult) -> str:
@@ -17,7 +17,7 @@ def plain_email(result: ResearchResult) -> str:
 
 def html_email(topic: str, result: ResearchResult, title: str) -> str:
     """Render only our supported Markdown; never trust model-generated HTML."""
-    format_report(result)  # Check that every citation has a source before rendering.
+    result = compact_sources(result)  # One shared mapping for body links and source list.
     cited = cited_source_numbers(result.report_text)
     urls = {}
     for number in cited:
@@ -80,6 +80,8 @@ def html_email(topic: str, result: ResearchResult, title: str) -> str:
     generated = result.run_summary.get('report_generated_at', '')
     researched = (f'<p style="font-size:12px;color:#64748b">Researched: {escape(generated)}</p>'
                   if generated else '')
+    limitation = (f'<p style="color:#854d0e;background:#fefce8;padding:12px">'
+                  f'{escape(source_note(result))}</p>' if source_note(result) else '')
     return ('<!doctype html><html lang="en"><head><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
             f'<title>{escape(title)}</title></head>'
@@ -95,7 +97,7 @@ def html_email(topic: str, result: ResearchResult, title: str) -> str:
             f'<tr><td style="padding:24px 28px"><h1 style="margin:0;font-size:22px;line-height:1.35;'
             f'color:#0f172a">{escape(topic)}</h1></td></tr>' + ''.join(sections) +
             '<tr><td style="padding:20px 28px;background:#f8fafc;border-top:1px solid #e2e8f0">'
-            '<h2 style="font-size:15px;margin:0 0 10px;color:#0f172a">Read the sources</h2>' + sources +
+            '<h2 style="font-size:15px;margin:0 0 10px;color:#0f172a">Read the sources</h2>' + limitation + sources +
             '<p style="font-size:12px;color:#64748b;margin:16px 0 0">AI-assisted research. '
             'Source links let you check the original reporting.</p>' + researched +
             '</td></tr></table></td></tr></table></body></html>')

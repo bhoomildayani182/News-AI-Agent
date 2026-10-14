@@ -63,7 +63,7 @@ class RunStore:
 
 def cache_key(topic, settings):
     # Scope caches by date, provider, models, preferences and credential fingerprint.
-    value = ['v2', ' '.join(topic.casefold().split()), settings.provider, settings.model,
+    value = ['v7-official-page-evidence', ' '.join(topic.casefold().split()), settings.provider, settings.model,
              settings.review_model, settings.preferred_sources,
              datetime.now(timezone.utc).date().isoformat(),
              hashlib.sha256(settings.api_key.encode()).hexdigest()]
@@ -81,10 +81,13 @@ class RunLog:
     status: str = 'running'
     calls: list = field(default_factory=list)
     decisions: list = field(default_factory=list)
+    source_fetches: list = field(default_factory=list)
     cache_hit: bool = False
     report_generated_at: str = ''
     source_count: int = 0
     publishers: list = field(default_factory=list)
+    evidence_mode: str = ''
+    single_publisher: bool = False
     error: str = ''
     elapsed_seconds: float = 0
     clock_started: float = field(default_factory=time.monotonic, repr=False)
@@ -94,9 +97,11 @@ class RunLog:
         return dict(run_id=self.run_id, started=self.started, provider='openrouter',
                     model=self.model, reviewer=self.reviewer, stage=self.stage,
                     status=self.status, calls=self.calls, decisions=self.decisions,
+                    source_fetches=self.source_fetches,
                     api_calls=len(self.calls), cache_hit=self.cache_hit,
                     report_generated_at=self.report_generated_at or self.started,
                     source_count=self.source_count, publishers=self.publishers,
+                    evidence_mode=self.evidence_mode, single_publisher=self.single_publisher,
                     reported_cost_usd=round(sum(reported), 8),
                     cost_complete=all(call['cost_usd'] is not None for call in self.calls),
                     estimated_budget_used_usd=round(sum(

@@ -167,8 +167,8 @@ class PipelineTests(unittest.TestCase):
         draft = self.draft.replace('[S1] [S2]', '[S1] [S2, S3] [S5] [S6]')
         validate_structure(Evidence('Evidence', sources, []), draft)
         rendered = format_report(ResearchResult(draft, sources))
-        for i in (1, 2, 3, 5, 6):
-            self.assertIn(f'[S{i}] Source {i}\nhttps://example.com/{i}', rendered)
+        for display, i in enumerate((1, 2, 3, 5, 6), 1):
+            self.assertIn(f'[S{display}] Source {i}\nhttps://example.com/{i}', rendered)
         self.assertNotIn('[S4] Source 4', rendered)
 
     def test_unknown_grouped_citation_rejected(self):
