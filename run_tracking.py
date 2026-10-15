@@ -1,6 +1,7 @@
 """Private local run history and a short cache; no keys or raw prompts are saved."""
 
 from dataclasses import dataclass, field
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -26,8 +27,14 @@ class RunStore:
         except (OSError, sqlite3.Error):
             raise ConfigurationError('Cannot open .agent-data run history. Use a writable project folder.') from None
 
+    @contextmanager
     def connect(self):
-        return sqlite3.connect(self.path, timeout=10)
+        db = sqlite3.connect(self.path, timeout=10)
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def save_run(self, summary):
         try:
@@ -63,8 +70,9 @@ class RunStore:
 
 def cache_key(topic, settings):
     # Scope caches by date, provider, models, preferences and credential fingerprint.
-    value = ['v7-official-page-evidence', ' '.join(topic.casefold().split()), settings.provider, settings.model,
+    value = ['v8-length-recovery', ' '.join(topic.casefold().split()), settings.provider, settings.model,
              settings.review_model, settings.preferred_sources,
+             settings.reasoning_effort,
              datetime.now(timezone.utc).date().isoformat(),
              hashlib.sha256(settings.api_key.encode()).hexdigest()]
     return hashlib.sha256(json.dumps(value).encode()).hexdigest()
@@ -89,6 +97,8 @@ class RunLog:
     evidence_mode: str = ''
     single_publisher: bool = False
     error: str = ''
+    limit_kind: str = ''
+    limit_setting: str = ''
     elapsed_seconds: float = 0
     clock_started: float = field(default_factory=time.monotonic, repr=False)
 
@@ -113,7 +123,7 @@ class RunLog:
                     search_count_complete=all(not call['search_enabled'] or
                         call.get('search_requests') is not None for call in self.calls),
                     elapsed_seconds=round(time.monotonic() - self.clock_started, 2),
-                    error=self.error)
+                    error=self.error, limit_kind=self.limit_kind, limit_setting=self.limit_setting)
 
     def save(self):
         self.store.save_run(self.summary())

@@ -11,9 +11,22 @@ from email_delivery import EmailConfigurationError, build_email, send_email
 from main import main
 from stages import ResearchError, ResearchResult, Source
 from email_format import html_email, plain_email
+from openrouter_client import RunLimitReached
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_cli_limit_is_not_mislabelled_as_http_error_and_never_sends(self):
+        stderr = io.StringIO()
+        with patch('sys.argv', ['main.py', '--send-email']), patch('main.get_settings'), \
+             patch('main.validate_email_settings'), patch('main.get_topic', return_value='Topic'), \
+             patch('main.research_topic', side_effect=RunLimitReached('Please review the run budget.')), \
+             patch('main.send_email') as send, contextlib.redirect_stderr(stderr), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(main(), 1)
+        self.assertIn('Agent limit reached', stderr.getvalue())
+        self.assertNotIn('HTTP', stderr.getvalue())
+        send.assert_not_called()
+
     def test_preview_and_send_cannot_be_combined(self):
         with patch('sys.argv', ['main.py', '--preview-email', '--send-email']), \
              patch('main.research_topic') as research, \

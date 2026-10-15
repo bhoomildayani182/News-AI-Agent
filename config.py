@@ -28,6 +28,11 @@ class Settings:
     max_run_cost_usd: float = 0.03
     max_research_rounds: int = 2
     cache_minutes: int = 15
+    research_max_tokens: int = 2400
+    report_max_tokens: int = 4096
+    recovery_max_tokens: int = 8192
+    max_length_retries: int = 1
+    reasoning_effort: str = 'low'
 
 
 def get_settings(*, require_api_key: bool = True) -> Settings:
@@ -61,14 +66,28 @@ def get_settings(*, require_api_key: bool = True) -> Settings:
         budget = float(os.getenv('OPENROUTER_MAX_RUN_COST_USD', '0.03'))
         rounds = int(os.getenv('RESEARCH_MAX_ROUNDS', '2'))
         cache_minutes = int(os.getenv('REPORT_CACHE_MINUTES', '15'))
+        research_tokens = int(os.getenv('OPENROUTER_RESEARCH_MAX_TOKENS', '2400'))
+        report_tokens = int(os.getenv('OPENROUTER_REPORT_MAX_TOKENS', '4096'))
+        recovery_tokens = int(os.getenv('OPENROUTER_RECOVERY_MAX_TOKENS', '8192'))
+        length_retries = int(os.getenv('OPENROUTER_MAX_LENGTH_RETRIES', '1'))
+        reasoning_effort = os.getenv('OPENROUTER_REASONING_EFFORT', 'low').strip().lower() or 'low'
         if not math.isfinite(budget) or not 0 < budget <= 1:
             raise ValueError()
         if not 1 <= rounds <= 2 or not 0 <= cache_minutes <= 60:
             raise ValueError()
+        if (not 256 <= research_tokens <= 16384 or not 256 <= report_tokens <= 16384
+                or not max(research_tokens, report_tokens) <= recovery_tokens <= 32768
+                or length_retries not in (0, 1)
+                or reasoning_effort not in {'provider_default', 'none', 'minimal', 'low', 'medium', 'high'}):
+            raise ValueError()
     except ValueError:
         raise ConfigurationError('Use a positive budget up to $1, 1–2 research rounds, '
-                                 'and 0–60 cache minutes.') from None
+                                 'and 0–60 cache minutes. Output limits must be 256–16384 tokens; '
+                                 'recovery must cover both output limits, up to 32768 tokens. '
+                                 'Use 0 or 1 length retries and a valid reasoning effort.') from None
     return Settings(api_key=api_key, model=model, preferred_sources=preferred,
                     review_model=review_model, provider=provider,
                     max_run_cost_usd=budget, max_research_rounds=rounds,
-                    cache_minutes=cache_minutes)
+                    cache_minutes=cache_minutes, research_max_tokens=research_tokens,
+                    report_max_tokens=report_tokens, recovery_max_tokens=recovery_tokens,
+                    max_length_retries=length_retries, reasoning_effort=reasoning_effort)

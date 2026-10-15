@@ -14,7 +14,7 @@ from google.genai import errors
 from config import ConfigurationError, get_settings
 from email_delivery import EmailConfigurationError, send_email, validate_email_settings
 from stages import ResearchError, research_topic
-from openrouter_client import OpenRouterError
+from openrouter_client import OpenRouterError, ProviderResponseError, RunLimitReached
 from run_tracking import record_delivery, usage_text
 
 
@@ -74,6 +74,9 @@ class JobState:
             record_delivery(summary, 'accepted_by_smtp')
         except (ConfigurationError, EmailConfigurationError) as error:
             status, message = 'failed', str(error)
+        except RunLimitReached as error:
+            summary = getattr(error, 'run_summary', {})
+            status, message = 'limit_reached', 'Agent limit reached. ' + str(error)[:600] + ' No email was sent.'
         except ResearchError as error:
             summary = getattr(error, 'run_summary', {})
             detail = str(error).replace(' No report or email produced.', '')[:600]
@@ -87,7 +90,17 @@ class JobState:
             )
         except OpenRouterError as error:
             summary = getattr(error, 'run_summary', {})
-            status, message = 'failed', f'OpenRouter HTTP {error.code}: {error} No email was sent.'
+            if error.code in (402, 429):
+                status = 'limit_reached'
+                message = ('The provider account has insufficient credits. Check OpenRouter billing.'
+                           if error.code == 402 else
+                           'The provider rate/quota limit was reached. Wait before retrying and check OpenRouter usage limits.')
+                message += ' No email was sent. Changing the agent run budget does not fix provider limits.'
+            else:
+                status, message = 'failed', f'OpenRouter could not complete the request (HTTP {error.code}). {error} No email was sent.'
+        except ProviderResponseError as error:
+            summary = getattr(error, 'run_summary', {})
+            status, message = 'failed', str(error)[:600] + ' No email was sent.'
         except (httpx.HTTPError, smtplib.SMTPException, OSError) as error:
             summary = getattr(error, 'run_summary', summary)
             if delivery_started:
@@ -128,6 +141,7 @@ textarea {{width:100%;box-sizing:border-box;padding:12px;font:inherit;border:1px
 button {{margin-top:16px;background:#164aa2;color:white;border:0;border-radius:8px;padding:12px 20px;font:inherit;cursor:pointer}}
 button:disabled {{background:#98a5b9;cursor:wait}} .notice {{padding:14px;border-radius:8px;margin:20px 0 0}}
 .running {{background:#e7f0ff}} .sent {{background:#e3f6e8}} .failed {{background:#fff0ed}}
+.limit_reached {{background:#fff8df;color:#713f12;border:1px solid #f1d88a}}
 small {{display:block;margin-top:18px;color:#52627b}}
 </style></head><body><main><h1>AI News Research Agent</h1>
 <p>Enter a news topic. The agent will research it and email a short, sourced report.</p>

@@ -8,7 +8,8 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 
-from openrouter_client import BudgetExceeded, OpenRouterClient, OpenRouterError
+from openrouter_client import (BudgetExceeded, OpenRouterClient, OpenRouterError,
+                               ProviderResponseError, RunLimitReached)
 from config import ConfigurationError
 from run_tracking import RunLog, RunStore, cache_key, usage_text
 from official_sources import refresh_sources
@@ -334,7 +335,8 @@ def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None
         repair_used = False
         progress('starting', f'OpenRouter models: {settings.model} / review: '
                  f'{settings.review_model or settings.model}; run budget guard ${settings.max_run_cost_usd:.3f}')
-        with OpenRouterClient(settings, log) as client:
+        with OpenRouterClient(settings, log,
+                              on_progress=lambda message: progress('recovery', message)) as client:
             for round_number in range(1, settings.max_research_rounds + 1):
                 progress('research', f'Research round {round_number}/{settings.max_research_rounds}: finding source evidence')
                 response = client.complete('research', settings.model,
@@ -448,7 +450,9 @@ def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None
                     'If essential evidence is missing, return passed=false, needs_research=true and a targeted query. '
                     'If not repairable, passed=false and explain briefly in issues. '
                     'source_id values must exactly match supplied IDs, e.g. S1, without brackets. '
-                    'Return checks for EVERY source cited in your FINAL sections, not only the original draft.')
+                    'Return checks for EVERY source cited in your FINAL sections, not only the original draft. '
+                    'Check only cited sources. Keep each assessment reason and policy reason under '
+                    '20 words and each issue under 30 words. Do not output a chain-of-thought.')
                 verdict = _object(client.complete('review', settings.review_model or settings.model,
                     review_prompt,
                     {'topic': topic, 'today': date.today().isoformat(), 'sources': pool, 'draft': draft,
@@ -500,17 +504,22 @@ def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None
                 if not verdict['needs_research']:
                     raise ResearchError('Report review failed: ' + feedback)
                 query = _query(verdict.get('next_query'), topic + ' official explanation')
-        raise ResearchError('Research limit reached. No report or email produced. ' +
-                            (feedback or 'Not enough independent, supported evidence.'))
+        raise RunLimitReached('Research limit reached before a verified report was available. '
+                              'Try a narrower topic, or review RESEARCH_MAX_ROUNDS (maximum 2) '
+                              'and OPENROUTER_MAX_RUN_COST_USD. ' +
+                              (feedback or 'The available evidence was insufficient.'),
+                              kind='research', setting='RESEARCH_MAX_ROUNDS')
     except Exception as error:
-        log.status = 'failed'
-        if isinstance(error, (ResearchError, BudgetExceeded, OpenRouterError, ConfigurationError)):
+        log.status = 'limit_reached' if isinstance(error, RunLimitReached) else 'failed'
+        if isinstance(error, RunLimitReached):
+            log.limit_kind, log.limit_setting = error.kind, error.setting
+        if isinstance(error, (ResearchError, BudgetExceeded, OpenRouterError, ProviderResponseError, ConfigurationError)):
             log.error = str(error)[:600]
         elif isinstance(error, httpx.HTTPError):
             log.error = 'Network request failed; billed cost may be unavailable. No automatic retry.'
         else:
             log.error = 'Unexpected local error: ' + type(error).__name__
-        if isinstance(error, BudgetExceeded):
+        if isinstance(error, BudgetExceeded) and not isinstance(error, RunLimitReached):
             error = ResearchError(log.error)
         error.run_summary = log.summary()
         raise error

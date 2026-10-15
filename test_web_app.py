@@ -7,10 +7,40 @@ import unittest
 from unittest.mock import Mock, patch
 
 from stages import ResearchError
+from openrouter_client import RunLimitReached, OpenRouterError
 from web_app import HOST, PORT, Handler, JobState, main, page
 
 
 class WebAppTests(unittest.TestCase):
+    def test_output_limit_is_an_actionable_notice_and_never_sends_email(self):
+        error = RunLimitReached('Increase OPENROUTER_RECOVERY_MAX_TOKENS and restart.',
+                                kind='output', setting='OPENROUTER_RECOVERY_MAX_TOKENS')
+        error.run_summary = {'run_id': 'limit-test', 'api_calls': 4,
+                             'reported_cost_usd': 0.006, 'cost_complete': True}
+        state = JobState()
+        with patch('web_app.get_settings'), patch('web_app.validate_email_settings'), \
+             patch('web_app.research_topic', side_effect=error), patch('web_app.send_email') as send:
+            state._run('Topic')
+        _, status, message = state.snapshot()
+        self.assertEqual(status, 'limit_reached')
+        self.assertIn('Agent limit reached', message)
+        self.assertIn('OPENROUTER_RECOVERY_MAX_TOKENS', message)
+        self.assertNotIn('502', message)
+        self.assertIn('notice limit_reached', page(status=status, message=message).decode())
+        self.assertEqual(state.run_summary()['reported_cost_usd'], 0.006)
+        send.assert_not_called()
+
+    def test_provider_credit_and_rate_limits_do_not_advise_increasing_agent_budget(self):
+        for code in (402, 429):
+            state = JobState()
+            with patch('web_app.get_settings'), patch('web_app.validate_email_settings'), \
+                 patch('web_app.research_topic', side_effect=OpenRouterError(code)), \
+                 patch('web_app.send_email') as send:
+                state._run('Topic')
+            self.assertEqual(state.snapshot()[1], 'limit_reached')
+            self.assertIn('Changing the agent run budget does not fix provider limits', state.snapshot()[2])
+            send.assert_not_called()
+
     def test_container_binds_all_interfaces_but_advertises_local_browser_url(self):
         output = io.StringIO()
         with patch.dict(os.environ, {'APP_BIND_HOST': '0.0.0.0'}), \

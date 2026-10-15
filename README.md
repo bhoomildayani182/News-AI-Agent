@@ -263,9 +263,16 @@ An OpenRouter run normally uses three model requests: search, decision/draft,
 and review. If essential evidence is missing, it can perform one targeted follow-up
 round, with at most six normal model requests and two search-enabled requests total.
 One additional evidence-only repair is permitted for final validation problems
-(at most seven calls total with two rounds). It makes no new search, respects the
+(at most seven calls before length recovery). It makes no new search, respects the
 same run budget, and cannot relabel a rejected source to force success.
-HTTP failures and malformed JSON responses do not trigger automatic paid retries.
+If a response is cut off by its output allowance (`finish_reason=length`), one
+additional stage-only regeneration is permitted for the whole run, after checking
+the budget. This gives a maximum of eight API calls with two rounds, one content
+repair and one length recovery. A recovered draft/review does not search again.
+An incomplete research response with usable source excerpts is reused without
+paying for another search. A research retry without evidence still counts toward
+the two-search-request maximum. HTTP failures and malformed JSON do not trigger
+automatic paid retries.
 Cached runs make no API requests. Gemini retains its original three-call mode
 and one bounded correction. Live research may incur charges.
 
@@ -339,6 +346,48 @@ Explicitly time-sensitive questions bypass this cache automatically, even when
 
 ## Cost controls and run history
 
+### Balanced output allowances and clear limit notices
+
+These defaults apply automatically even when an older `.env` does not contain them:
+
+```dotenv
+OPENROUTER_RESEARCH_MAX_TOKENS=2400
+OPENROUTER_REPORT_MAX_TOKENS=4096
+OPENROUTER_RECOVERY_MAX_TOKENS=8192
+OPENROUTER_MAX_LENGTH_RETRIES=1
+OPENROUTER_REASONING_EFFORT=low
+```
+
+Output allowances cover the full structured response and, where applicable,
+internal reasoning—not only the short email. The email remains capped at 300
+words. A larger allowance is a ceiling, not an automatic charge for that many tokens.
+Low reasoning effort is requested only when the model advertises reasoning
+support; use `provider_default` to omit that parameter. The selected model has
+not been changed. The provider's advertised output cap is respected when available.
+
+The app first tries to recover a cut-off response once using the same evidence,
+a larger allowance and concise output instructions. It never concatenates partial
+JSON, bypasses source checks, increases your budget automatically or retries SMTP.
+Every attempt, including unsuccessful generation, can incur charges.
+
+When an allowance is exhausted, the web page shows an amber **Agent limit reached**
+notice—not a fabricated HTTP 502. It explains which setting to review:
+
+- Output length: narrow the topic or increase `OPENROUTER_RECOVERY_MAX_TOKENS`.
+- Run cost: review actual usage, then increase `OPENROUTER_MAX_RUN_COST_USD` only
+  if you accept potentially higher spending. The default remains `$0.03`.
+- Research allowance: narrow the question; `RESEARCH_MAX_ROUNDS` supports 1–2.
+- Provider HTTP 402/429: check account credits or rate/quota limits; changing the
+  app's budget does not fix an exhausted provider allowance.
+
+Research/report limits support 256–16384 tokens; the recovery ceiling must cover
+both limits and be at most 32768. Length retries support only 0 or 1 per run.
+After changing `.env`, restart Python or run
+`docker compose up --build --force-recreate --wait`. No email is sent when a
+complete, verified report cannot be produced.
+
+### Spending and diagnostics
+
 OpenRouter checks published model prices before a paid request, caps output
 tokens, disables the old account-level web plugin on writing/review requests,
 and checks estimated spending against `OPENROUTER_MAX_RUN_COST_USD`. Requests
@@ -365,6 +414,9 @@ The local `.agent-data/runs.sqlite3` contains research stages, decisions, failur
 usage and cached reports. It is ignored by Git. Keys and raw API responses are
 not logged. Email acceptance is recorded separately from research; an SMTP success message means the
 mail server accepted the email, not that inbox delivery has been independently verified.
+`--history` also shows actual HTTP status, finish reason, requested output limit,
+reported output/reasoning tokens and whether a length recovery was used. These
+fields help distinguish truncation from an actual upstream HTTP failure.
 
 ## Optional: more detailed research
 
@@ -405,8 +457,9 @@ default mode. OpenRouter always uses the bounded loop above, including when
   return actual findings or sufficient relevant evidence; the agent makes at most one
   targeted follow-up before stopping without email.
 - **Budget guard stopped:** inspect `--history` before increasing the budget.
-- **Incomplete provider response:** inspect the finish reason in local history;
-  no automatic paid retry is made.
+- **Response cut off / agent limit reached:** one budget-checked length recovery
+  is attempted when enabled. If it cannot finish, follow the notice and inspect
+  `--history`; never assume it is a provider outage or increase every limit blindly.
 - **Validation failed:** no email is sent. Try a more specific question with
   clearer official coverage, then inspect the sources.
 - **Email failed:** check SMTP host, port, credentials, and allowed sender address.

@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from config import ConfigurationError, Settings, get_settings
-from openrouter_client import OpenRouterError
+from openrouter_client import OpenRouterError, ProviderResponseError, RunLimitReached
 from research_agent import add_sources, run_openrouter, _accepted_report, initial_query, is_official_source
 from email_format import plain_email, html_email
 from run_tracking import RunStore
@@ -64,7 +64,7 @@ class OpenRouterTests(unittest.TestCase):
                                           reason='Covers the requested announcement and period.')
                                           for i in (1, 2)]))
 
-    def run_agent(self, responses, *, settings=None, topic='Test topic', fresh=False):
+    def run_agent(self, responses, *, settings=None, topic='Test topic', fresh=False, catalog_options=None):
         with patch('openrouter_client.httpx.Client') as constructor:
             http = constructor.return_value
             catalog = Mock()
@@ -73,6 +73,8 @@ class OpenRouterTests(unittest.TestCase):
                  'pricing': {'prompt': '0.0000001', 'completion': '0.0000004'}},
                 {'id': 'google/gemini-3.1-flash-lite',
                  'pricing': {'prompt': '0.00000025', 'completion': '0.0000015'}}]}
+            for item in catalog.json.return_value['data']:
+                item.update((catalog_options or {}).get(item['id'], {}))
             http.get.return_value = catalog
             http.post.side_effect = responses
             with contextlib.redirect_stdout(io.StringIO()):
@@ -221,7 +223,7 @@ class OpenRouterTests(unittest.TestCase):
                      reason='Only the existence of a report is mentioned.',
                      evidence_check=dict(sufficient=False, missing_information=['Main findings']))
         replies = [completion('Report exists', annotations=annotations), completion(json.dumps(draft))] * 2
-        with self.assertRaisesRegex(ResearchError, 'Research limit reached'):
+        with self.assertRaisesRegex(RunLimitReached, 'Research limit reached'):
             self.run_agent(replies)
         self.assertEqual(self.store.recent()[0]['api_calls'], 4)
 
@@ -268,7 +270,7 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(calls[2]['model'], self.settings.review_model)
         review_data = json.loads(calls[2]['messages'][1]['content'])
         self.assertRegex(review_data['today'], r'^\d{4}-\d{2}-\d{2}$')
-        self.assertTrue(all(call['max_tokens'] <= 2000 for call in calls))
+        self.assertEqual([call['max_tokens'] for call in calls], [2400, 4096, 4096])
         self.assertTrue(all(call['plugins'][0]['enabled'] is False for call in calls))
         self.assertAlmostEqual(result.run_summary['reported_cost_usd'], 0.0015)
         self.assertEqual(result.sources[0].url, 'https://rba.gov.au/decision')
@@ -302,11 +304,11 @@ class OpenRouterTests(unittest.TestCase):
         replies = [completion('First', annotations=self.annotations), completion(self.draft),
                    completion(reject), completion('Second', annotations=self.annotations),
                    completion(self.draft), completion(reject)]
-        with self.assertRaisesRegex(ResearchError, 'Research limit reached'):
+        with self.assertRaisesRegex(RunLimitReached, 'Research limit reached'):
             self.run_agent(replies)
         log = self.store.recent()[0]
         self.assertEqual(log['api_calls'], 6)
-        self.assertEqual(log['status'], 'failed')
+        self.assertEqual(log['status'], 'limit_reached')
         self.assertEqual(log['stage'], 'review')
         self.assertAlmostEqual(log['reported_cost_usd'], 0.003)
 
@@ -328,7 +330,7 @@ class OpenRouterTests(unittest.TestCase):
 
     def test_missing_excerpt_stops_before_draft_and_review(self):
         no_text = [dict(type='url_citation', url='https://rba.gov.au/a', title='RBA')]
-        with self.assertRaisesRegex(ResearchError, 'Research limit reached'):
+        with self.assertRaisesRegex(RunLimitReached, 'Research limit reached'):
             self.run_agent([completion('Notes', annotations=no_text)] * 2)
         self.assertEqual(self.store.recent()[0]['api_calls'], 2)
 
@@ -445,7 +447,7 @@ class OpenRouterTests(unittest.TestCase):
         bad['source_checks'] = []
         replies = [completion('Notes', annotations=self.annotations, cost=0.005),
                    completion(self.draft, cost=0.005), completion(json.dumps(bad), cost=0.005)]
-        with self.assertRaisesRegex(ResearchError, 'budget'):
+        with self.assertRaisesRegex(RunLimitReached, 'budget'):
             self.run_agent(replies, settings=replace(self.settings, max_run_cost_usd=0.018))
         self.assertEqual(self.store.recent()[0]['api_calls'], 3)
 
@@ -476,7 +478,7 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(http.post.call_count, 3)
 
     def test_budget_blocks_request_before_spending(self):
-        with self.assertRaisesRegex(ResearchError, 'budget'):
+        with self.assertRaisesRegex(RunLimitReached, 'budget'):
             self.run_agent([], settings=replace(self.settings, max_run_cost_usd=0.000001))
         self.assertEqual(self.store.recent()[0]['api_calls'], 0)
 
@@ -507,10 +509,143 @@ class OpenRouterTests(unittest.TestCase):
         self.assertFalse(log['cost_complete'])
         self.assertNotIn('private text', json.dumps(log))
 
-    def test_truncated_or_malformed_response_has_no_retry(self):
-        with self.assertRaises(OpenRouterError):
-            self.run_agent([completion('Incomplete', finish='length')])
+    def test_exhausted_length_recovery_is_a_limit_not_fake_http_502(self):
+        with self.assertRaisesRegex(RunLimitReached, 'response-length limit'):
+            self.run_agent([completion('Incomplete', finish='length')] * 2)
+        log = self.store.recent()[0]
+        self.assertEqual(log['api_calls'], 2)
+        self.assertEqual(log['status'], 'limit_reached')
+        self.assertEqual(log['limit_kind'], 'output')
+        self.assertEqual(log['calls'][-1]['http_status'], 200)
+
+    def test_truncated_draft_recovers_only_that_stage_without_research_again(self):
+        replies = self.standard()[:1] + [completion('{"action":', finish='length')]
+        replies += [completion(self.draft), completion(self.passed)]
+        result, http = self.run_agent(replies)
+        calls = [c.kwargs['json'] for c in http.post.call_args_list]
+        self.assertEqual([c['stage'] for c in result.run_summary['calls']],
+                         ['research', 'decision', 'decision', 'review'])
+        self.assertEqual([c['max_tokens'] for c in calls], [2400, 4096, 8192, 4096])
+        self.assertNotIn('tools', calls[2])
+        self.assertEqual(sum(c['search_enabled'] for c in result.run_summary['calls']), 1)
+        self.assertAlmostEqual(result.run_summary['reported_cost_usd'], 0.002)
+
+    def test_truncated_reviewer_recovers_without_resending_or_redrafting(self):
+        result, http = self.run_agent(self.standard()[:2] + [completion('', finish='length'),
+                                                           completion(self.passed)])
+        self.assertEqual([c['stage'] for c in result.run_summary['calls']],
+                         ['research', 'decision', 'review', 'review'])
+        self.assertEqual(http.post.call_count, 4)
+        self.assertTrue(result.run_summary['calls'][-1]['length_retry'])
+
+    def test_only_one_length_recovery_is_allowed_across_all_stages(self):
+        replies = self.standard()[:1] + [completion('', finish='length'), completion(self.draft),
+                                        completion('', finish='length')]
+        with self.assertRaises(RunLimitReached):
+            self.run_agent(replies)
+        log = self.store.recent()[0]
+        self.assertEqual(log['api_calls'], 4)
+        self.assertEqual(sum(bool(c.get('length_retry')) for c in log['calls']), 1)
+
+    def test_budget_blocks_length_recovery_before_another_paid_request(self):
+        replies = self.standard()[:1] + [completion('', finish='length', cost=0.02)]
+        with self.assertRaisesRegex(RunLimitReached, 'run budget'):
+            self.run_agent(replies, settings=replace(self.settings, model='google/gemini-3.1-flash-lite'))
+        log = self.store.recent()[0]
+        self.assertEqual(log['api_calls'], 2)
+        self.assertEqual(log['limit_kind'], 'cost')
+
+    def test_retry_can_be_disabled_explicitly(self):
+        with self.assertRaises(RunLimitReached):
+            self.run_agent([completion('', finish='length')],
+                           settings=replace(self.settings, max_length_retries=0))
         self.assertEqual(self.store.recent()[0]['api_calls'], 1)
+
+    def test_truncated_search_with_evidence_does_not_repeat_search(self):
+        replies = [completion('', annotations=self.annotations, finish='length')]
+        result, http = self.run_agent(replies + self.standard()[1:])
+        self.assertEqual(http.post.call_count, 3)
+        self.assertFalse(any(c.get('length_retry') for c in result.run_summary['calls']))
+
+    def test_truncated_search_without_evidence_uses_at_most_two_search_requests(self):
+        replies = [completion('', finish='length')] + self.standard()
+        result, http = self.run_agent(replies)
+        self.assertEqual(sum(c['search_enabled'] for c in result.run_summary['calls']), 2)
+        self.assertEqual(http.post.call_count, 4)
+
+    def test_bad_json_response_is_not_reported_as_http_502_or_retried(self):
+        bad = Mock(status_code=200)
+        bad.json.return_value = {'usage': {'cost': 0.001}, 'choices': []}
+        with self.assertRaises(ProviderResponseError) as caught:
+            self.run_agent([bad])
+        self.assertNotIsInstance(caught.exception, OpenRouterError)
+        self.assertEqual(self.store.recent()[0]['api_calls'], 1)
+
+    def test_actual_upstream_502_remains_an_http_error_without_retry(self):
+        bad = Mock(status_code=502)
+        bad.json.return_value = {'error': {'message': 'private provider response'}}
+        with self.assertRaises(OpenRouterError) as caught:
+            self.run_agent([bad])
+        self.assertEqual(caught.exception.code, 502)
+        self.assertEqual(self.store.recent()[0]['calls'][0]['http_status'], 502)
+
+    def test_eight_call_bound_includes_two_rounds_repair_and_length_recovery(self):
+        gap = json.loads(self.passed)
+        gap.update(passed=False, needs_research=True, issues=['Need date'], next_query='official date')
+        missing = json.loads(self.passed)
+        missing['source_checks'] = []
+        replies = self.standard()[:2] + [completion(json.dumps(gap))] + self.standard()[:2]
+        replies += [completion('', finish='length'), completion(json.dumps(missing)), completion(self.passed)]
+        result, http = self.run_agent(replies)
+        self.assertEqual(http.post.call_count, 8)
+        self.assertEqual(result.run_summary['status'], 'complete')
+        self.assertEqual(sum(c['search_enabled'] for c in result.run_summary['calls']), 2)
+
+    def test_reasoning_effort_and_usage_are_recorded_only_when_supported(self):
+        last = completion(self.passed)
+        last.json.return_value['usage']['completion_tokens_details'] = {'reasoning_tokens': 80}
+        options = {self.settings.review_model: {'supported_parameters': ['reasoning'],
+                    'reasoning': {'supported_efforts': ['low', 'high'], 'mandatory': True}}}
+        result, http = self.run_agent(self.standard()[:2] + [last], catalog_options=options)
+        calls = [c.kwargs['json'] for c in http.post.call_args_list]
+        self.assertNotIn('reasoning', calls[0])
+        self.assertEqual(calls[-1]['reasoning'], {'effort': 'low'})
+        self.assertEqual(result.run_summary['calls'][-1]['reasoning_tokens'], 80)
+
+    def test_model_advertised_output_cap_is_respected(self):
+        options = {self.settings.model: {'top_provider': {'max_completion_tokens': 3000}}}
+        _, http = self.run_agent(self.standard(), catalog_options=options)
+        self.assertEqual(http.post.call_args_list[1].kwargs['json']['max_tokens'], 3000)
+
+    def test_model_output_cap_notice_does_not_recommend_impossible_larger_retry(self):
+        options = {self.settings.model: {'top_provider': {'max_completion_tokens': 4096}}}
+        with self.assertRaisesRegex(RunLimitReached, 'advertises an output cap') as caught:
+            self.run_agent(self.standard()[:1] + [completion('', finish='length')], catalog_options=options)
+        self.assertEqual(caught.exception.setting, 'OPENROUTER_MODEL')
+        self.assertEqual(self.store.recent()[0]['api_calls'], 2)
+
+    def test_new_output_settings_are_validated_and_default_to_balanced_limits(self):
+        env = {'AI_PROVIDER': 'openrouter', 'OPENROUTER_API_KEY': 'test-key',
+               'OPENROUTER_RESEARCH_MAX_TOKENS': '2400', 'OPENROUTER_REPORT_MAX_TOKENS': '4096',
+               'OPENROUTER_RECOVERY_MAX_TOKENS': '8192', 'OPENROUTER_MAX_LENGTH_RETRIES': '1',
+               'OPENROUTER_REASONING_EFFORT': 'low'}
+        with patch.dict(os.environ, env):
+            settings = get_settings()
+        self.assertEqual((settings.research_max_tokens, settings.report_max_tokens,
+                          settings.recovery_max_tokens), (2400, 4096, 8192))
+        for changes in ({'OPENROUTER_MAX_LENGTH_RETRIES': '10'},
+                        {'OPENROUTER_RECOVERY_MAX_TOKENS': '1000'},
+                        {'OPENROUTER_REPORT_MAX_TOKENS': '-1'},
+                        {'OPENROUTER_REASONING_EFFORT': 'unlimited'}):
+            with patch.dict(os.environ, dict(env, **changes)), self.assertRaises(ConfigurationError):
+                get_settings()
+
+    def test_history_transactions_close_database_connections(self):
+        import sqlite3
+        with self.store.connect() as db:
+            db.execute('SELECT 1')
+        with self.assertRaises(sqlite3.ProgrammingError):
+            db.execute('SELECT 1')
 
     def test_search_evidence_remains_usable_when_server_tool_budget_ends(self):
         replies = [completion('', annotations=self.annotations, finish='tool_calls'),
@@ -531,7 +666,7 @@ class OpenRouterTests(unittest.TestCase):
             self.run_agent(self.standard()[:2] + [completion(json.dumps(verdict))] * 2)
 
     def test_actual_cost_over_budget_prevents_another_request(self):
-        with self.assertRaisesRegex(ResearchError, 'budget'):
+        with self.assertRaisesRegex(RunLimitReached, 'budget'):
             self.run_agent([completion('Notes', annotations=self.annotations, cost=0.04)])
         self.assertEqual(self.store.recent()[0]['api_calls'], 1)
 

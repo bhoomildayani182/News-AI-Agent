@@ -15,7 +15,7 @@ from demo import DEMO_TOPIC, demo_result
 from email_delivery import (EmailConfigurationError, build_email, send_email,
                             validate_email_settings)
 from stages import ResearchError, format_report, research_topic
-from openrouter_client import OpenRouterError
+from openrouter_client import OpenRouterError, ProviderResponseError, RunLimitReached
 from run_tracking import RunStore, record_delivery, usage_text
 
 
@@ -75,6 +75,13 @@ def main() -> int:
                 print(f"  {item['status']} at {item['stage']}: {item.get('error') or 'OK'}")
                 if item.get('delivery_status'):
                     print('  Email: ' + item['delivery_status'])
+                for call in item.get('calls', []):
+                    reasoning = call.get('reasoning_tokens')
+                    print(f"  {call['stage']}: HTTP {call.get('http_status', 'unknown')}; "
+                          f"finish={call.get('finish_reason', 'unknown')}; "
+                          f"output={call.get('output_tokens', 0)}/{call.get('max_tokens', 'unknown')}; "
+                          f"reasoning={reasoning if reasoning is not None else 'unavailable'}; "
+                          f"length recovery={bool(call.get('length_retry'))}")
             if not history:
                 print('No local OpenRouter runs yet.')
             return 0
@@ -116,6 +123,10 @@ def main() -> int:
             record_delivery(result.run_summary, 'accepted_by_smtp')
             print('\nEmail sent successfully.')
         return 0
+    except RunLimitReached as error:
+        print(f'Agent limit reached. {error} No email was sent.', file=sys.stderr)
+    except ProviderResponseError as error:
+        print(f'{error} No email was sent.', file=sys.stderr)
     except (ConfigurationError, ResearchError, EmailConfigurationError) as error:
         print(f'Error: {error}', file=sys.stderr)
     except (smtplib.SMTPException, OSError):
