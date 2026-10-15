@@ -20,6 +20,48 @@ MAX_BYTES = 4 * 1024 * 1024
 MAX_CHARS = 7000
 
 
+def latest_rba_statement(topic, *, include_discovery=False):
+    """Discover the latest statement from RBA's own index, never a fixed date/URL."""
+    if not (re.search(r'\bRBA\b|Reserve Bank of Australia', topic, re.I)
+            and re.search(r'\blatest\b|most recent|current', topic, re.I)
+            and re.search(r'decision|cash rate|interest rate', topic, re.I)):
+        return []
+    index = 'https://www.rba.gov.au/monetary-policy/int-rate-decisions/'
+    try:
+        with httpx.Client(timeout=httpx.Timeout(12, connect=5), follow_redirects=False) as client:
+            with client.stream('GET', index) as response:
+                response.raise_for_status()
+                if 'text/html' not in response.headers.get('content-type', '').lower():
+                    return []
+                content = bytearray()
+                for chunk in response.iter_bytes():
+                    content.extend(chunk)
+                    if len(content) > MAX_BYTES:
+                        return []
+        links = re.findall(r'href=[\"\'](/media-releases/\d{4}/mr-\d{2}-\d+\.html)[\"\']',
+                           content.decode('utf-8', errors='replace'))
+        if not links:
+            return []
+        source = dict(id='S1', title='RBA monetary policy decision (official statement)',
+                      url=urljoin(index, links[0]), publisher='rba.gov.au', published_at='', excerpt='')
+        # This date comes from the official index label, not a guessed URL date.
+        label = re.search(re.escape(links[0]) + r'[\"\'][^>]*>([^<]+)</a>',
+                          content.decode('utf-8', errors='replace'), re.I)
+        if label:
+            try:
+                source['event_date'] = datetime.strptime(label.group(1).strip(), '%d %B %Y').date().isoformat()
+            except ValueError:
+                pass
+        refresh_sources([source], topic)
+        # Never publish a discovered URL or placeholder as retrieved evidence.
+        if source.get('evidence_origin') == 'official_page':
+            return [source]
+        # A URL discovered on the index is a search target, NOT factual evidence.
+        return [source] if include_discovery else []
+    except (httpx.HTTPError, ValueError, UnicodeError):
+        return []
+
+
 def safe_url(url):
     try:
         parts = urlsplit(url)
@@ -98,6 +140,7 @@ def refresh_sources(pool, topic):
                     if not safe_url(url):
                         break
                     with client.stream('GET', url, headers={'User-Agent': 'AI-News-Research/1.0'}) as response:
+                        attempt['http_status'] = response.status_code
                         if response.status_code in {301, 302, 303, 307, 308}:
                             url = urljoin(url, response.headers.get('location', ''))
                             continue

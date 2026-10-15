@@ -1,6 +1,7 @@
 """Economical research loop: search, decide, review; at most two rounds."""
 
 from datetime import date
+from copy import deepcopy
 import ipaddress
 import json
 import re
@@ -12,7 +13,7 @@ from openrouter_client import (BudgetExceeded, OpenRouterClient, OpenRouterError
                                ProviderResponseError, RunLimitReached)
 from config import ConfigurationError
 from run_tracking import RunLog, RunStore, cache_key, usage_text
-from official_sources import refresh_sources
+from official_sources import refresh_sources, latest_rba_statement
 from stages import (HEADINGS, Evidence, ResearchError, ResearchResult, Source,
                     SOURCE_CITATION, cited_source_numbers, read_report, validate_structure)
 
@@ -108,6 +109,8 @@ def _url(value):
             return ''
         if host == 'localhost' or '.' not in host:
             return ''
+        if host.removeprefix('www.') == 'rba.gov.au' and parts.path in {'', '/'}:
+            return ''  # Homepage snippets cannot stand in for a policy statement.
         try:
             ipaddress.ip_address(host)
             return ''
@@ -146,10 +149,20 @@ def add_sources(pool, annotations, preferred):
         if not url or not isinstance(excerpt, str) or len(excerpt.strip()) < 40:
             continue
         host = publisher(url)
+        # Reuters articles are legitimately republished on partner sites. Keep
+        # hosting transparent and count copies as ONE editorial publisher.
+        hosting = (urlsplit(url).hostname or '').removeprefix('www.')
+        syndicated = hosting in {'finance.yahoo.com', 'investing.com', 'marketscreener.com'}
+        reuters_credit = syndicated and bool(re.search(
+            r'(?:\(Reuters\)|\bBy Reuters\b|\bReuters\s*[-–—|])',
+            excerpt + ' ' + str(entry.get('title') or ''), re.I))
         if host in {'facebook.com', 'youtube.com', 'x.com', 'tiktok.com'}:
             continue
         title = entry.get('title') or host
         title = str(title).strip()[:220]
+        if reuters_credit:
+            title = f'Reuters, republished by {hosting}: {title}'[:220]
+            host = 'reuters.com'
         published = entry.get('published_at') or entry.get('published_date') or ''
         if not isinstance(published, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', published):
             published = ''  # Never infer a publication date from a URL.
@@ -198,7 +211,89 @@ def initial_query(topic):
     if (re.search(r'\breport\b', topic, re.I)
             and re.search(r'\b(findings|statistics|trends|results)\b', topic, re.I)):
         return topic + ' key findings statistics trends executive summary year in review'
-    return topic
+    return expand_topic(topic)
+
+
+def expand_topic(topic):
+    """Disambiguate short institution names before search, not after failure."""
+    expanded = re.sub(r'\bRBA\b', 'Reserve Bank of Australia (RBA)', topic, flags=re.I)
+    if (re.search(r'\bRBA\b', topic, re.I) and re.search(r'\bdecision\b', topic, re.I)
+            and not re.search(r'card|surcharge|financial stability', topic, re.I)):
+        expanded += ' cash rate interest rate monetary policy'
+    return expanded
+
+
+def missing_publisher_query(topic, query, pool, feedback=''):
+    """Target an explicitly requested, absent publisher—not every preference."""
+    known = {'RBA': 'rba.gov.au', 'Reuters': 'reuters.com', 'ABC': 'abc.net.au', 'AFR': 'afr.com'}
+    if re.search(r'\bsite:', query, re.I):
+        return query
+    named_in_query = [(name, domain) for name, domain in known.items()
+                      if name != 'RBA' and re.search(r'\b' + name + r'\b', query, re.I)]
+    if len(named_in_query) == 1:
+        return _query(f'site:{named_in_query[0][1]} {query} {expand_topic(topic)}', query)
+    # Presence of an ABC URL is not proof of relevant ABC coverage. Reviewer
+    # feedback must override the publisher-presence heuristic.
+    for name, domain in known.items():
+        if name != 'RBA' and re.search(
+                r'(?:missing[^.;]*\b' + name + r'\b|(?:no|not contain|lack)[^.;]*\b' + name + r'\b)',
+                feedback, re.I):
+            return _query(f'site:{domain} {query} {expand_topic(topic)}', query)
+    for name, domain in known.items():
+        if re.search(r'\b' + name + r'\b', topic, re.I) and not any(
+                source['publisher'] == domain for source in pool):
+            # Do not carry contradictory site restrictions from an earlier query.
+            cleaned = re.sub(r'\bsite:\S+', '', query)
+            return _query(f'site:{domain} {expand_topic(topic)} {cleaned}',
+                          f'site:{domain} {expand_topic(topic)}')
+    return query
+
+
+def requested_search_domains(topic, query):
+    """Restrict publisher-specific searches without restricting ordinary topics."""
+    publishers = {'Reuters': 'reuters.com', 'ABC': 'abc.net.au',
+                  'AFR': 'afr.com', 'RBA': 'rba.gov.au'}
+    targeted = [domain for domain in publishers.values()
+                if re.search(r'\bsite:' + re.escape(domain) + r'(?:\s|/|$)', query, re.I)]
+    if targeted:
+        if 'reuters.com' in targeted:
+            targeted += ['finance.yahoo.com', 'investing.com', 'marketscreener.com']
+        return targeted
+    named = [domain for name, domain in publishers.items()
+             if re.search(r'\b' + name + r'\b', topic, re.I)]
+    # An ordinary RBA question should still discover independent journalism.
+    if 'reuters.com' in named:
+        named += ['finance.yahoo.com', 'investing.com', 'marketscreener.com']
+    return named if any(domain != 'rba.gov.au' for domain in named) else []
+
+
+def same_event_annotations(topic, annotations, event_date=''):
+    """Exclude clearly different RBA reports before they can contaminate a comparison."""
+    if not (re.search(r'\bRBA\b|Reserve Bank of Australia', topic, re.I)
+            and re.search(r'decision|cash rate|interest rate', topic, re.I)
+            and not re.search(r'financial stability', topic, re.I)):
+        return annotations
+    retained = []
+    for item in annotations:
+        entry = (item.get('url_citation') or item) if isinstance(item, dict) else {}
+        if isinstance(entry, dict) and re.search(r'financial[-_/ ]stability[-_/ ]review',
+                                               str(entry.get('url', '')), re.I):
+            continue
+        if isinstance(entry, dict) and event_date:
+            # URL dates are only an exclusion hint. Never label them as verified
+            # publication dates. Old previews cannot describe a later decision.
+            hint = re.search(r'\b(\d{4}-\d{2}-\d{2})\b', str(entry.get('url', '')))
+            if hint and hint.group(1) < event_date:
+                continue
+        retained.append(item)
+    return retained
+
+
+def missing_requested_publishers(topic, sources):
+    requested = {'ABC': 'abc.net.au', 'Reuters': 'reuters.com', 'AFR': 'afr.com'}
+    available = {source['publisher'] for source in sources}
+    return [name for name, domain in requested.items()
+            if re.search(r'\b' + name + r'\b', topic, re.I) and domain not in available]
 
 
 def time_sensitive(topic):
@@ -295,7 +390,8 @@ def _accepted_report(verdict, pool, forbidden=()):
     return report
 
 
-def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None):
+def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None,
+                   resume_sources=None, resume_query='', checkpoint=None):
     store = store or RunStore()
     log = RunLog(store, settings.model, settings.review_model or settings.model)
     log.save()  # Verify history is writable before any API call or cache reuse.
@@ -331,30 +427,128 @@ def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None
                     return ResearchResult(report, _evidence(cached['evidence']).sources, log.summary())
                 except (ResearchError, KeyError, TypeError, IndexError):
                     pass  # Corrupt or old-format cache entries are never published.
-        pool, query, feedback = [], initial_query(topic), ''
+        if checkpoint and (checkpoint.get('topic') != topic or
+                           checkpoint.get('date') != date.today().isoformat() or
+                           checkpoint.get('model') != settings.model or
+                           checkpoint.get('reviewer') != settings.review_model):
+            raise ResearchError('This research checkpoint has expired or the model changed. Start a fresh request.')
+        saved = deepcopy(checkpoint) if checkpoint else dict(
+            topic=topic, date=date.today().isoformat(), model=settings.model,
+            reviewer=settings.review_model, steps=[], evidence={})
+        if checkpoint:
+            pool = deepcopy(saved.get('seed', []))
+        else:
+            pool = [dict(source) for source in (resume_sources or [])]
+            if not pool:
+                progress('official_discovery', 'Checking the official decision index before search')
+                discovered = latest_rba_statement(topic, include_discovery=True)
+                saved['official_target'] = discovered[0]['url'] if discovered else ''
+                saved['event_date'] = discovered[0].get('event_date', '') if discovered else ''
+                pool = [s for s in discovered if s.get('evidence_origin') == 'official_page']
+            saved['seed'] = deepcopy(pool)
+        query = initial_query(topic) if checkpoint else _query(resume_query, initial_query(topic))
+        if saved.get('event_date'):
+            query = saved['event_date'] + ' ' + query
+        feedback = ('Continue previous research: ' + resume_query) if resume_query and not checkpoint else ''
         repair_used = False
         progress('starting', f'OpenRouter models: {settings.model} / review: '
                  f'{settings.review_model or settings.model}; run budget guard ${settings.max_run_cost_usd:.3f}')
         with OpenRouterClient(settings, log,
                               on_progress=lambda message: progress('recovery', message)) as client:
+            # Reconstruct control flow using completed responses in memory. Only
+            # the interrupted step and subsequent steps make paid API requests.
+            request = client.complete
+            position = 0
+
+            def complete(stage, model, system, data, **kwargs):
+                nonlocal position
+                signature = json.dumps([stage, model, system, data, kwargs], sort_keys=True)
+                if position < len(saved['steps']):
+                    step = saved['steps'][position]
+                    if step['signature'] != signature:
+                        raise ResearchError('Checkpoint no longer matches this workflow. Start a fresh request.')
+                    position += 1
+                    progress('resume', f'Reusing completed {stage} step (no API charge)')
+                    return deepcopy(step['response'])
+                response = request(stage, model, system, data, **kwargs)
+                saved['steps'].append(dict(signature=signature, response=deepcopy(response)))
+                position += 1
+                return response
+
+            client.complete = complete
             for round_number in range(1, settings.max_research_rounds + 1):
+                if round_number > 1:
+                    query = missing_publisher_query(topic, query, pool, feedback)
+                    target = saved.get('official_target', '')
+                    if target and not any(urlsplit(s['url']).path == urlsplit(target).path
+                                          and s['publisher'] == 'rba.gov.au' for s in pool):
+                        # Never override an explicit missing-publisher query.
+                        if not any(d in query for d in ('site:abc.net.au', 'site:reuters.com', 'site:afr.com')):
+                            query = f'site:rba.gov.au {target} Monetary Policy Decision stated reasons inflation'
+                if saved.get('event_date') and saved['event_date'] not in query:
+                    query = saved['event_date'] + ' ' + query
                 progress('research', f'Research round {round_number}/{settings.max_research_rounds}: finding source evidence')
                 response = client.complete('research', settings.model,
-                    RULES + RELEVANCE_RULES + ' Use the web search tool once with a focused query. Find the '
+                    RULES + RELEVANCE_RULES + ' Use the web search tool once with the supplied query. '
+                    'Respect search_domains: these publishers are specifically requested, not optional '
+                    'preferences. Do not substitute banks or unrelated publishers. If a requested '
+                    'publisher is inaccessible or no matching article is retrieved, state that '
+                    'coverage was not retrieved; do not claim the article does not exist. '
+                    'Reuters reporting republished by a partner is acceptable ONLY with explicit '
+                    'Reuters credit in the excerpt; disclose the hosting site. Copies of one wire '
+                    'story are not independent corroboration. Find the '
                     'primary announcement and independent reporting. Return brief notes with '
                     'actual requested findings and statistics, not merely a page mentioning '
                     'the report. For report summaries, search the issuing agency\'s report or '
                     'official key-findings factsheet; establish the latest available reporting period. '
                     'source citations. Do not repeat a failed search or give an unsourced answer.',
                     {'topic': topic, 'query': query, 'today': date.today().isoformat(),
+                     'official_statement_target': saved.get('official_target', ''),
+                     'search_domains': requested_search_domains(topic, query),
                      'preferred_sources': settings.preferred_sources, 'missing_evidence': feedback}, search=True)
-                add_sources(pool, response['annotations'], settings.preferred_sources)
+                # Reserve room for newly found explicitly requested publishers.
+                annotations = same_event_annotations(topic, response['annotations'], saved.get('event_date', ''))
+                incoming = []
+                add_sources(incoming, annotations, settings.preferred_sources)
+                targeted_hosts = requested_search_domains(topic, query)
+                # A focused follow-up must be able to replace stale articles.
+                # Otherwise the two-per-publisher cap can permanently lock in bad hits.
+                if round_number > 1 and len(targeted_hosts) == 1:
+                    incoming_urls = {s['url'] for s in incoming}
+                    refreshed_publishers = {s['publisher'] for s in incoming}
+                    pool = [s for s in pool if s['publisher'] not in refreshed_publishers
+                            or s['url'] in incoming_urls or s.get('evidence_origin') == 'official_page']
+                    for number, source in enumerate(pool, 1):
+                        source['id'] = f'S{number}'
+                requested = {'Reuters': 'reuters.com', 'ABC': 'abc.net.au', 'AFR': 'afr.com'}
+                new_requested = [s for s in incoming if any(
+                    re.search(r'\b' + name + r'\b', topic, re.I) and s['publisher'] == domain
+                    for name, domain in requested.items()) and not any(
+                        old['publisher'] == s['publisher'] for old in pool)]
+                if new_requested:
+                    pool = (new_requested + [s for s in pool if s['url'] not in
+                                             {n['url'] for n in new_requested}])[:8]
+                    for number, source in enumerate(pool, 1):
+                        source['id'] = f'S{number}'
+                add_sources(pool, annotations, settings.preferred_sources)
                 progress('evidence', 'Checking original official pages for current evidence')
-                fetched = refresh_sources(pool, topic)
+                if round_number in saved['evidence']:
+                    pool = deepcopy(saved['evidence'][round_number])
+                    fetched = []
+                else:
+                    fetched = refresh_sources(pool, topic)
+                    saved['evidence'][round_number] = deepcopy(pool)
                 log.source_fetches.extend(fetched)
                 log.source_count = len(pool)
                 log.publishers = sorted({source['publisher'] for source in pool})
                 has_official = any(is_official_source(s['url']) for s in pool)
+                missing_publishers = missing_requested_publishers(topic, pool)
+                if missing_publishers:
+                    feedback = 'Missing evidence from requested publisher: ' + missing_publishers[0]
+                    domain = {'ABC': 'abc.net.au', 'Reuters': 'reuters.com', 'AFR': 'afr.com'}[missing_publishers[0]]
+                    query = f'site:{domain} {expand_topic(topic)}'
+                    log.decisions.append(dict(action='research', reason=feedback))
+                    continue
                 if not pool or (len({source['publisher'] for source in pool}) < 2 and not has_official):
                     feedback = 'Need usable original official evidence or multiple relevant publishers. Search for actual report findings, not an article merely mentioning the report.'
                     query = topic + ' official statement independent news reporting'
@@ -489,6 +683,15 @@ def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None
                         raise ResearchError('Automatic recovery could not verify this brief: ' +
                                             '; '.join(verdict['issues'])[:400])
                 if report is not None:
+                    cited = [pool[n - 1] for n in cited_source_numbers(report)]
+                    absent = missing_requested_publishers(topic, cited)
+                    if absent:
+                        feedback = 'The report did not cite verified reporting from ' + ', '.join(absent)
+                        domain = {'ABC': 'abc.net.au', 'Reuters': 'reuters.com', 'AFR': 'afr.com'}[absent[0]]
+                        query = f'site:{domain} {expand_topic(topic)}'
+                        log.decisions.append(dict(action='research', reason=feedback))
+                        continue
+                if report is not None:
                     log.status, log.stage = 'complete', 'verified_report'
                     store.cache(key, {'sections': verdict['sections'], 'evidence': pool,
                                       'source_checks': verdict['source_checks'],
@@ -505,11 +708,17 @@ def run_openrouter(topic, settings, *, fresh=False, on_progress=None, store=None
                     raise ResearchError('Report review failed: ' + feedback)
                 query = _query(verdict.get('next_query'), topic + ' official explanation')
         raise RunLimitReached('Research limit reached before a verified report was available. '
-                              'Try a narrower topic, or review RESEARCH_MAX_ROUNDS (maximum 2) '
-                              'and OPENROUTER_MAX_RUN_COST_USD. ' +
+                              'The available searches did not supply the required evidence. '
+                              'Increasing the money budget alone will not fix missing coverage. ' +
                               (feedback or 'The available evidence was insufficient.'),
                               kind='research', setting='RESEARCH_MAX_ROUNDS')
     except Exception as error:
+        if isinstance(error, RunLimitReached):
+            # Keep evidence in memory for an explicitly approved continuation.
+            # Never turn unreviewed evidence into a supposedly verified answer.
+            error.resume_sources = locals().get('pool', [])
+            error.resume_query = locals().get('query', '')
+            error.checkpoint = locals().get('saved')
         log.status = 'limit_reached' if isinstance(error, RunLimitReached) else 'failed'
         if isinstance(error, RunLimitReached):
             log.limit_kind, log.limit_setting = error.kind, error.setting

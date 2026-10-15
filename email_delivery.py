@@ -31,7 +31,8 @@ def build_email(topic: str, result: ResearchResult, sender: str, recipient: str)
     if any(c in sender_name + subject_title for c in '\r\n'):
         raise EmailConfigurationError('Email name and title must be single-line text.')
     message = EmailMessage()
-    message['Subject'] = f'{subject_title}: {clean_topic}'
+    prefix = '[Partial research] ' if result.run_summary.get('partial') else ''
+    message['Subject'] = f'{prefix}{subject_title}: {clean_topic}'
     message['From'] = formataddr((sender_name, sender)) if sender_name else sender
     message['To'] = recipient
     message.set_content(plain_email(result))

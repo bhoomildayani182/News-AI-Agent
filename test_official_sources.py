@@ -5,7 +5,7 @@ from unittest.mock import Mock, patch
 
 import httpx
 
-from official_sources import MAX_BYTES, PageText, refresh_sources, safe_url, select_excerpt
+from official_sources import MAX_BYTES, PageText, refresh_sources, safe_url, select_excerpt, latest_rba_statement
 from research_agent import publisher
 
 
@@ -24,6 +24,39 @@ def response(body, status=200, **headers):
 
 
 class OfficialSourceTests(unittest.TestCase):
+    def test_latest_rba_discovery_uses_live_index_and_actual_statement_text(self):
+        with patch('official_sources.httpx.Client') as constructor:
+            client = constructor.return_value.__enter__.return_value
+            client.stream.side_effect = [
+                response('<a href="/media-releases/2026/mr-26-27.html">29 September 2026</a>'),
+                response('<main><h1>Monetary Policy Decision</h1><p>' +
+                         'The Reserve Bank announced its decision and explained its rationale. ' * 5 + '</p></main>')]
+            pool = latest_rba_statement('Compare ABC and Reuters on the latest RBA decision')
+        self.assertEqual(len(pool), 1)
+        self.assertTrue(pool[0]['url'].endswith('mr-26-27.html'))
+        self.assertEqual(pool[0]['evidence_origin'], 'official_page')
+        self.assertEqual(pool[0]['event_date'], '2026-09-29')
+        self.assertIn('explained its rationale', pool[0]['excerpt'])
+
+    def test_official_discovery_failure_does_not_create_placeholder_evidence(self):
+        with patch('official_sources.httpx.Client') as constructor:
+            client = constructor.return_value.__enter__.return_value
+            client.stream.side_effect = httpx.ConnectError('Offline')
+            self.assertEqual(latest_rba_statement('Latest RBA decision'), [])
+        with patch('official_sources.httpx.Client') as constructor:
+            self.assertEqual(latest_rba_statement('Latest Australian GDP release'), [])
+            constructor.assert_not_called()
+
+    def test_blocked_statement_url_is_only_a_search_target_not_evidence(self):
+        with patch('official_sources.httpx.Client') as constructor, \
+             patch('official_sources.refresh_sources', return_value=[]):
+            client = constructor.return_value.__enter__.return_value
+            client.stream.return_value = response(
+                '<a href="/media-releases/2026/mr-26-27.html">Latest</a>')
+            discovered = latest_rba_statement('Latest RBA decision', include_discovery=True)
+        self.assertEqual(discovered[0]['excerpt'], '')
+        self.assertNotIn('evidence_origin', discovered[0])
+
     def test_only_explicit_https_hosts_are_fetchable(self):
         self.assertTrue(safe_url('https://docs.cloud.google.com/run/docs/release-notes'))
         for url in ('http://docs.cloud.google.com/a', 'https://docs.cloud.google.com.evil.example/a',

@@ -12,7 +12,9 @@ from unittest.mock import Mock, patch
 
 from config import ConfigurationError, Settings, get_settings
 from openrouter_client import OpenRouterError, ProviderResponseError, RunLimitReached
-from research_agent import add_sources, run_openrouter, _accepted_report, initial_query, is_official_source
+from research_agent import (add_sources, run_openrouter, _accepted_report, initial_query,
+                            is_official_source, missing_publisher_query, requested_search_domains,
+                            same_event_annotations, missing_requested_publishers)
 from email_format import plain_email, html_email
 from run_tracking import RunStore
 from stages import HEADINGS, ResearchError, research_topic
@@ -35,9 +37,19 @@ def annotation(url, text, title='News'):
 
 class OpenRouterTests(unittest.TestCase):
     def setUp(self):
+        # Tests must not inherit private/local .env limits or credentials.
+        environment = patch.dict(os.environ, {}, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
+        dotenv = patch('config.load_dotenv')
+        dotenv.start()
+        self.addCleanup(dotenv.stop)
         fetcher = patch('research_agent.refresh_sources', return_value=[])
         fetcher.start()
         self.addCleanup(fetcher.stop)
+        seed = patch('research_agent.latest_rba_statement', return_value=[])
+        seed.start()
+        self.addCleanup(seed.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.store = RunStore(Path(self.temp.name) / 'runs.sqlite3')
@@ -64,7 +76,8 @@ class OpenRouterTests(unittest.TestCase):
                                           reason='Covers the requested announcement and period.')
                                           for i in (1, 2)]))
 
-    def run_agent(self, responses, *, settings=None, topic='Test topic', fresh=False, catalog_options=None):
+    def run_agent(self, responses, *, settings=None, topic='Test topic', fresh=False,
+                  catalog_options=None, checkpoint=None):
         with patch('openrouter_client.httpx.Client') as constructor:
             http = constructor.return_value
             catalog = Mock()
@@ -79,12 +92,123 @@ class OpenRouterTests(unittest.TestCase):
             http.post.side_effect = responses
             with contextlib.redirect_stdout(io.StringIO()):
                 result = run_openrouter(topic, settings or self.settings,
-                                        store=self.store, fresh=fresh)
+                                        store=self.store, fresh=fresh, checkpoint=checkpoint)
             return result, http
 
     def standard(self):
         return [completion('Notes', annotations=self.annotations),
                 completion(self.draft), completion(self.passed)]
+
+    def test_approved_checkpoint_resumes_review_without_paying_for_research_or_draft(self):
+        with self.assertRaises(RunLimitReached) as stopped:
+            self.run_agent(self.standard()[:2] + [RunLimitReached('Budget reached',
+                           kind='cost', setting='OPENROUTER_MAX_RUN_COST_USD')])
+        checkpoint = stopped.exception.checkpoint
+        self.assertEqual(len(checkpoint['steps']), 2)
+        with patch('research_agent.refresh_sources') as fetch:
+            result, http = self.run_agent([completion(self.passed)], fresh=True,
+                settings=replace(self.settings, max_run_cost_usd=0.06), checkpoint=checkpoint)
+        self.assertEqual(http.post.call_count, 1)
+        self.assertEqual([c['stage'] for c in result.run_summary['calls']], ['review'])
+        self.assertNotIn('tools', http.post.call_args.kwargs['json'])
+        fetch.assert_not_called()
+
+    def test_request_only_extra_rounds_replay_old_steps_without_paying_again(self):
+        request_more = json.dumps(dict(action='research', reason='Need current facts',
+                                       next_query='Test topic current facts'))
+        replies = [completion('Notes', annotations=self.annotations), completion(request_more)] * 2
+        with self.assertRaises(RunLimitReached) as stopped:
+            self.run_agent(replies)
+        result, http = self.run_agent(self.standard(), fresh=True,
+            settings=replace(self.settings, max_research_rounds=4),
+            checkpoint=stopped.exception.checkpoint)
+        self.assertEqual(http.post.call_count, 3)
+        self.assertEqual(result.run_summary['api_calls'], 3)
+        self.assertEqual(self.settings.max_research_rounds, 2)
+
+    def test_changed_model_checkpoint_refuses_paid_work(self):
+        with self.assertRaises(RunLimitReached) as stopped:
+            self.run_agent([RunLimitReached('Budget reached', kind='cost', setting='budget')])
+        with self.assertRaisesRegex(ResearchError, 'checkpoint has expired or the model changed'):
+            self.run_agent([], settings=replace(self.settings, model='changed'),
+                           checkpoint=stopped.exception.checkpoint)
+
+    def test_missing_named_publisher_uses_targeted_search_not_all_preferences(self):
+        pool = [{'publisher': 'rba.gov.au'}, {'publisher': 'abc.net.au'}]
+        query = missing_publisher_query('Compare ABC and Reuters on RBA',
+                                        'Reuters RBA September decision', pool)
+        self.assertIn('site:reuters.com', query)
+        self.assertNotIn('site:abc.net.au', query)
+        self.assertEqual(missing_publisher_query('Explain the RBA decision', 'RBA news', pool),
+                         'RBA news')
+
+    def test_named_publisher_constraints_reach_search_engine(self):
+        result, http = self.run_agent(self.standard(), topic='Compare ABC on the latest RBA decision')
+        search = http.post.call_args_list[0].kwargs['json']['tools'][0]['parameters']
+        self.assertEqual(set(search['allowed_domains']), {'abc.net.au', 'rba.gov.au'})
+
+    def test_targeted_domain_filter_does_not_get_overridden_by_original_topic(self):
+        self.assertEqual(requested_search_domains('Compare ABC Reuters and RBA',
+                         'site:reuters.com RBA decision September'),
+                         ['reuters.com', 'finance.yahoo.com', 'investing.com', 'marketscreener.com'])
+        self.assertEqual(requested_search_domains('Explain the RBA decision', 'RBA news'), [])
+        self.assertEqual(requested_search_domains('Explain Australian GDP', 'latest GDP'), [])
+
+    def test_reuters_syndication_requires_credit_and_deduplicates_editorial_publisher(self):
+        pool = []
+        add_sources(pool, [annotation('https://finance.yahoo.com/news/example',
+            'SYDNEY (Reuters) - The Reserve Bank of Australia announced a new decision today.'),
+            annotation('https://www.investing.com/news/example',
+            'By Reuters - Australia central bank announced its cash rate decision and reasons today.')], ())
+        self.assertEqual({s['publisher'] for s in pool}, {'reuters.com'})
+        self.assertIn('republished by finance.yahoo.com', pool[0]['title'])
+        other = []
+        add_sources(other, [annotation('https://finance.yahoo.com/news/uncredited',
+            'The Reserve Bank of Australia announced a decision today. This is uncredited reporting.')], ())
+        self.assertEqual(other[0]['publisher'], 'yahoo.com')
+
+    def test_rba_homepage_is_not_an_official_statement_substitute(self):
+        pool = []
+        add_sources(pool, [annotation('https://www.rba.gov.au/?app_v2=redirect',
+            'The central bank announces the latest policy decisions. This is a homepage snippet.')], ())
+        self.assertEqual(pool, [])
+
+    def test_financial_stability_review_is_not_monetary_decision_coverage(self):
+        items = [annotation('https://www.abc.net.au/news/rba-financial-stability-review',
+                            'This article covers a different RBA report.'),
+                 annotation('https://www.abc.net.au/news/rba-cash-rate-decision',
+                            'This article covers the cash rate decision.')]
+        result = same_event_annotations('Compare ABC and Reuters on the latest RBA decision', items)
+        self.assertEqual(result, items[1:])
+        self.assertEqual(same_event_annotations('Explain RBA financial stability review', items), items)
+
+    def test_official_event_date_excludes_old_previews_without_inventing_publication_date(self):
+        old = annotation('https://www.abc.net.au/news/2026-08-10/rba-preview', 'Old preview evidence.')
+        current = annotation('https://www.abc.net.au/news/2026-09-29/rba-decision', 'Current evidence.')
+        retained = same_event_annotations('Latest RBA decision', [old, current], '2026-09-29')
+        self.assertEqual(retained, [current])
+        self.assertNotIn('published_at', current['url_citation'])
+
+    def test_investing_article_cannot_be_relabelled_as_reuters_by_the_model(self):
+        self.assertEqual(missing_requested_publishers('Compare ABC and Reuters',
+            [{'publisher': 'abc.net.au'}, {'publisher': 'investing.com'}]), ['Reuters'])
+        self.assertEqual(missing_requested_publishers('Explain the RBA decision',
+            [{'publisher': 'rba.gov.au'}]), [])
+
+    def test_missing_requested_publisher_skips_paid_drafting_until_evidence_exists(self):
+        with self.assertRaises(RunLimitReached):
+            self.run_agent([completion('Notes', annotations=self.annotations)] * 2,
+                           topic='Compare ABC and Reuters on the latest RBA decision')
+        calls = self.store.recent()[0]['calls']
+        self.assertEqual([c['stage'] for c in calls], ['research', 'research'])
+
+    def test_configuration_accepts_four_rounds_and_rejects_unbounded_rounds(self):
+        env = {'AI_PROVIDER': 'openrouter', 'OPENROUTER_API_KEY': 'fake', 'RESEARCH_MAX_ROUNDS': '4'}
+        with patch.dict(os.environ, env):
+            self.assertEqual(get_settings().max_research_rounds, 4)
+        with patch.dict(os.environ, dict(env, RESEARCH_MAX_ROUNDS='5')):
+            with self.assertRaises(ConfigurationError):
+                get_settings()
 
     def test_config_selects_openrouter_without_gemini_key(self):
         env = {'AI_PROVIDER': 'openrouter', 'OPENROUTER_API_KEY': 'test-key',
@@ -230,7 +354,8 @@ class OpenRouterTests(unittest.TestCase):
     def test_main_findings_search_targets_actual_report_results(self):
         question = 'Main findings of the latest ACSC threat report?'
         self.assertIn('statistics trends executive summary', initial_query(question))
-        self.assertEqual(initial_query('Latest RBA decision?'), 'Latest RBA decision?')
+        self.assertEqual(initial_query('Latest RBA decision?'),
+                         'Latest Reserve Bank of Australia (RBA) decision? cash rate interest rate monetary policy')
 
     def test_official_report_still_obeys_length_limit_and_can_be_shortened(self):
         annotations, draft, verdict = self.official_fixture()

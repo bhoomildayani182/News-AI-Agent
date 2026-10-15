@@ -1,6 +1,7 @@
 """Local, on-demand web page for researching and emailing one news topic."""
 
 from html import escape
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
 from secrets import token_urlsafe
@@ -34,15 +35,24 @@ class JobState:
         self.status = 'idle'
         self.message = ''
         self.summary = {}
+        self.continuation = None
+        self.override = None
 
     def snapshot(self):
         with self.lock:
             return self.topic, self.status, self.message
 
-    def start(self, topic):
+    def start(self, topic, *, continue_run=False):
         with self.lock:
             if self.status == 'running':
                 return False
+            if continue_run:
+                if not self.continuation or self.continuation['topic'] != topic:
+                    return False
+                self.override = self.continuation
+            else:
+                self.override = None
+            self.continuation = None
             self.topic = topic
             self.summary = {}
             self.status = 'running'
@@ -65,7 +75,17 @@ class JobState:
             settings = get_settings()
             validate_email_settings()
             if settings.provider == 'openrouter':
-                result = research_topic(topic, settings, on_progress=self.progress)
+                if self.override:
+                    settings = replace(settings,
+                        max_run_cost_usd=self.override['budget'],
+                        max_research_rounds=self.override['rounds'],
+                        research_max_tokens=self.override['research_tokens'],
+                        report_max_tokens=self.override['report_tokens'],
+                        recovery_max_tokens=self.override['tokens'])
+                    result = research_topic(topic, settings, on_progress=self.progress,
+                                            fresh=True, checkpoint=self.override['checkpoint'])
+                else:
+                    result = research_topic(topic, settings, on_progress=self.progress)
             else:
                 result = research_topic(topic, settings)
             summary = getattr(result, 'run_summary', {})
@@ -78,6 +98,65 @@ class JobState:
         except RunLimitReached as error:
             summary = getattr(error, 'run_summary', {})
             status, message = 'limit_reached', 'Agent limit reached. ' + str(error)[:600] + ' No email was sent.'
+            sources = getattr(error, 'resume_sources', [])
+            # One optional continuation, server-calculated bounds; never edit .env.
+            used_kinds = self.override['used_kinds'] if self.override else []
+            if (settings.provider == 'openrouter' and len(used_kinds) < 2
+                    and error.kind not in used_kinds
+                    and error.kind in {'cost', 'output', 'research'}
+                    and getattr(error, 'checkpoint', None)):
+                spent = max(0, float(summary.get('estimated_budget_used_usd',
+                                    summary.get('reported_cost_usd', 0)) or 0))
+                spent += self.override['previous_estimated_spend'] if self.override else 0
+                cap = self.override['total_cap'] if self.override else settings.max_run_cost_usd
+                # Extra search rounds do NOT authorize extra money. Only a cost
+                # stop offers a higher TOTAL cap, explicitly approved in the UI.
+                total_cap = min(cap * 2, 0.30) if error.kind == 'cost' else cap
+                rounds = (min(settings.max_research_rounds + 2, 4)
+                          if error.kind == 'research' else settings.max_research_rounds)
+                output_factor = 2 if error.kind == 'output' else 1
+                self.continuation = {'topic': topic, 'sources': sources,
+                    'checkpoint': error.checkpoint,
+                    'budget': max(0, total_cap - spent), 'total_cap': total_cap,
+                    'previous_cost': float(summary.get('reported_cost_usd', 0) or 0)
+                                     + (self.override['previous_cost'] if self.override else 0),
+                    'previous_estimated_spend': spent,
+                    'used_kinds': used_kinds + [error.kind],
+                    'kind': error.kind, 'rounds': rounds,
+                    'research_tokens': min(settings.research_max_tokens * output_factor, 16384),
+                    'report_tokens': min(settings.report_max_tokens * output_factor, 16384),
+                    'tokens': min(settings.recovery_max_tokens * output_factor, 32768)}
+                if (self.continuation['budget'] <= 0 or total_cap < cap
+                        or (error.kind == 'research' and rounds == settings.max_research_rounds)):
+                    self.continuation = None
+            if error.kind == 'research':
+                message = ('Research incomplete: required coverage could not be verified within '
+                           'the search allowance. Increasing the money budget alone will not fix '
+                           'missing articles. ' + str(error)[:450] + ' No email was sent.')
+            if sources:
+                # A discovery bulletin is not a factual summary or a validated report.
+                # Links only: do not send unchecked model claims or scraped passages.
+                from stages import ResearchResult, Source, SOURCE_CITATION
+                bulletin = ResearchResult(
+                    '## Partial research — not a verified answer\n'
+                    'The agent reached a limit before completing verification. '
+                    'These are discovered reading links, not proof that they answer your question. '
+                    'No completed comparison or verified conclusions are available.\n\n'
+                    '## Why research stopped\n' + SOURCE_CITATION.sub('', str(error)[:600]) + '\n\n'
+                    '## Reading links\n' + '\n'.join(
+                        f'- Discovered source [S{i}]' for i in range(1, len(sources) + 1)),
+                    [Source(s['title'], s['url'], s['publisher'], s.get('published_at', ''))
+                     for s in sources], {**summary, 'partial': True})
+                try:
+                    record_delivery(summary, 'sending_partial')
+                    send_email(topic, bulletin)
+                    record_delivery(summary, 'partial_accepted_by_smtp')
+                    message = message.replace('No email was sent.',
+                        'A partial reading-links email was sent, clearly marked as unverified.')
+                except Exception:
+                    record_delivery(summary, 'partial_delivery_unconfirmed')
+                    message = message.replace('No email was sent.',
+                        'Partial email delivery is unconfirmed. Check your inbox before retrying.')
         except ResearchError as error:
             summary = getattr(error, 'run_summary', {})
             detail = str(error).replace(' No report or email produced.', '')[:600]
@@ -113,6 +192,13 @@ class JobState:
             status, message = 'failed', 'The run failed unexpectedly. No success confirmation is available.'
         else:
             status, message = 'sent', 'Report completed and email sent to the address in EMAIL_TO.'
+        if self.override:
+            summary['previous_reported_cost_usd'] = self.override['previous_cost']
+            summary['total_reported_cost_usd'] = round(
+                self.override['previous_cost'] + float(summary.get('reported_cost_usd', 0) or 0), 8)
+            message += f' Combined reported cost: ${summary["total_reported_cost_usd"]:.6f}.'
+            if summary.get('run_id'):
+                record_delivery(summary, summary.get('delivery_status', 'not_started'))
         with self.lock:
             self.status, self.message = status, message
             self.summary = summary
@@ -131,6 +217,27 @@ def page(topic='', status='idle', message='', *, error='', summary=None):
     if summary:
         notice += f'<p class="notice">{escape(usage_text(summary))}</p>'
     refresh = '<meta http-equiv="refresh" content="4;url=/status">' if status == 'running' else ''
+    continuation = ''
+    with STATE.lock:
+        offer = dict(STATE.continuation) if STATE.continuation else None
+    if status == 'limit_reached' and offer and topic == offer['topic']:
+        button = ('Approve additional budget and continue' if offer['kind'] == 'cost'
+                  else 'Continue within existing budget')
+        continuation = (
+            '<div class="notice limit_reached"><strong>Optional additional research</strong>'
+            f'<p>Reason: {escape(message)} </p>'
+            f'<p>Total budget guard for this request: ${offer["total_cap"]:.3f}, including '
+            f'earlier work. Remaining allowance: ${offer["budget"]:.4f}. '
+            f'Maximum total research rounds: {offer["rounds"]}. '
+            f'Recovery output ceiling: {offer["tokens"]} tokens. '
+            'Previous charges still apply. Completed steps are reused without additional API '
+            'calls; the interrupted step resumes. A complete answer is not guaranteed. '
+            'This checkpoint expires on a date/model change. Defaults stay unchanged.</p>'
+            '<form method="post" action="/run">'
+            f'<input type="hidden" name="token" value="{STATE.token}">'
+            f'<input type="hidden" name="topic" value="{safe_topic}">'
+            '<input type="hidden" name="continue" value="yes">'
+            f'<button type="submit">{button}</button></form></div>')
     return f'''<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI News Research Agent</title>{refresh}
@@ -151,7 +258,7 @@ small {{display:block;margin-top:18px;color:#52627b}}
 <label for="topic">News topic or question</label>
 <textarea id="topic" name="topic" minlength="5" maxlength="500" required>{safe_topic}</textarea>
 <button type="submit" {'disabled' if status == 'running' else ''}>Research and send email</button>
-</form>{notice}
+</form>{notice}{continuation}
 <small>Runs one topic at a time. Keep this page open to see the result. Recent verified reports may be reused; new research uses API credits.</small>
 </main></body></html>'''.encode('utf-8')
 
@@ -201,9 +308,12 @@ class Handler(BaseHTTPRequestHandler):
         if not 5 <= len(topic) <= 500 or '\n' in topic or '\r' in topic:
             self._respond(400, page(topic, error='Enter a single-line topic between 5 and 500 characters.'))
             return
-        if not STATE.start(topic):
+        continue_run = fields.get('continue', [''])[0] == 'yes'
+        started = STATE.start(topic, continue_run=True) if continue_run else STATE.start(topic)
+        if not started:
             current_topic, status, message = STATE.snapshot()
-            self._respond(409, page(current_topic, status, message, error='A report is already running.'))
+            self._respond(409, page(current_topic, status, message,
+                error='This continuation is unavailable or a report is already running. Refresh the page.'))
             return
         self.send_response(303)
         self.send_header('Location', '/status')

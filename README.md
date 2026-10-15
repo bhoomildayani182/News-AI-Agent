@@ -8,7 +8,7 @@ explains it in plain English, and optionally emails the report.
 1. You enter a news topic or question.
 2. The agent researches current information and collects source links.
 3. With OpenRouter, it checks source diversity and same-story relevance, and decides whether to write or
-   search for a missing fact. Research is limited to two rounds.
+   search for a missing fact. Research defaults to two rounds, configurable up to four.
 4. A reviewer checks claims against the excerpts, explicitly assesses each cited
    source's relevance to the event, country and period, and returns a corrected brief,
    requests targeted evidence, or stops publication. If the final output has an
@@ -58,6 +58,44 @@ articles before relying on them.
 ## Start here: choose Docker or Python
 
 Both options run the same local web agent at `http://127.0.0.1:8765`.
+
+### When a research limit is reached
+
+The browser explains why research stopped. If sources were collected, it sends a
+**Partial research** email containing discovered reading links and the limitation.
+This is **not a verified answer**: unchecked model claims are not emailed as facts.
+If no sources were collected, there is no partial email. SMTP delivery failures
+remain explicit; check your inbox before retrying.
+
+Normal runs default to **two rounds**, not four. Four is an upper bound, not a
+requirement for every topic. When evidence is missing after two rounds, the page
+can offer **Continue within existing budget** for this topic only, up to four
+total rounds. This does **not** raise the total money cap. The follow-up search targets an
+explicitly requested missing publisher (for example `site:reuters.com`).
+Named ABC/Reuters/AFR comparisons also apply the search engine's `allowed_domains`
+filter, rather than relying only on the model to obey a `site:` query. Ordinary
+topics remain unrestricted; a domain filter still cannot guarantee retrieval.
+Only an actual cost stop offers **Approve additional budget and continue**, with
+the proposed higher **total** cap shown explicitly (at most USD 0.30). Previous
+spending is subtracted: a USD 0.03 cap with USD 0.01 already used leaves USD 0.02,
+not another USD 0.03. Approving a USD 0.06 total cap leaves USD 0.05 in that example.
+No increase happens without a click. Token ceilings stay unchanged for cost/search
+stops; only an output-length stop can offer larger token ceilings within the
+existing money cap. The provider may charge for completed work even if no verified
+report is possible; app budget guards are not provider-enforced spending limits.
+Completed model responses and fetched evidence are replayed locally with **no new
+API calls**; only the interrupted and remaining steps perform paid work. Workflow
+changes, model changes or a date change invalidate the checkpoint rather than
+silently redoing the paid work. No continuation is offered if the default budget
+exceeds USD 0.30. Output-stop research/report ceilings can double (maximum 16,384).
+
+Approval changes settings only in memory for this attempt, never `.env`. A new
+ordinary submission uses the defaults. At most two approvals are offered per original
+request, never twice for the same kind of limit. This permits a research extension
+and a separately approved budget extension without an endless paid loop.
+Restarting the app loses pending continuations. Provider credit/quota
+errors cannot be fixed by raising this budget. Complete reports still require the
+normal evidence and citation checks, and only complete reports enter the cache.
 Use only one option at a time so they do not compete for the same port.
 Keep the project anywhere; run commands from the folder containing `compose.yaml`
 and `main.py`.
@@ -188,7 +226,7 @@ and set these lines instead:
 AI_PROVIDER=openrouter
 OPENROUTER_API_KEY=your_real_openrouter_key_here
 OPENROUTER_MODEL=google/gemini-3.1-flash-lite
-OPENROUTER_REVIEW_MODEL=google/gemini-3.1-flash-lite
+OPENROUTER_REVIEW_MODEL=google/gemini-3-flash-preview
 OPENROUTER_MAX_RUN_COST_USD=0.03
 RESEARCH_MAX_ROUNDS=2
 REPORT_CACHE_MINUTES=15
@@ -261,8 +299,9 @@ What did the RBA announce in its most recent cash rate decision?
 ```
 
 An OpenRouter run normally uses three model requests: search, decision/draft,
-and review. If essential evidence is missing, it can perform one targeted follow-up
-round, with at most six normal model requests and two search-enabled requests total.
+and review. If essential evidence is missing, it can perform targeted follow-up
+rounds: default two rounds total, configurable up to four. Each round permits at
+most three normal model calls and one search-enabled request.
 One additional evidence-only repair is permitted for final validation problems
 (at most seven calls before length recovery). It makes no new search, respects the
 same run budget, and cannot relabel a rejected source to force success.
@@ -272,10 +311,18 @@ the budget. This gives a maximum of eight API calls with two rounds, one content
 repair and one length recovery. A recovered draft/review does not search again.
 An incomplete research response with usable source excerpts is reused without
 paying for another search. A research retry without evidence still counts toward
-the two-search-request maximum. HTTP failures and malformed JSON do not trigger
+the configured search-request maximum. With four rounds the maximum is 14 calls
+(12 normal, one repair and one length recovery), still subject to the money budget.
+HTTP failures and malformed JSON do not trigger
 automatic paid retries.
 Cached runs make no API requests. Gemini retains its original three-call mode
 and one bounded correction. Live research may incur charges.
+
+For latest RBA decision questions, the agent first discovers the newest statement
+from the RBA's official decision index and fetches its text (bounded public-page
+requests, no LLM charge). No decision date or article URL is hardcoded. Explicitly
+credited Reuters articles on supported republishing sites can supplement Reuters.com;
+the host is disclosed and copies count as one editorial source, not corroboration.
 
 ## 5. Preview the email
 
@@ -377,15 +424,17 @@ notice—not a fabricated HTTP 502. It explains which setting to review:
 - Output length: narrow the topic or increase `OPENROUTER_RECOVERY_MAX_TOKENS`.
 - Run cost: review actual usage, then increase `OPENROUTER_MAX_RUN_COST_USD` only
   if you accept potentially higher spending. The default remains `$0.03`.
-- Research allowance: narrow the question; `RESEARCH_MAX_ROUNDS` supports 1–2.
+- Research allowance: `RESEARCH_MAX_ROUNDS` supports 1–4 (default 2). Four rounds
+  can help multi-publisher comparisons; all calls still obey the configured budget.
 - Provider HTTP 402/429: check account credits or rate/quota limits; changing the
   app's budget does not fix an exhausted provider allowance.
 
 Research/report limits support 256–16384 tokens; the recovery ceiling must cover
 both limits and be at most 32768. Length retries support only 0 or 1 per run.
 After changing `.env`, restart Python or run
-`docker compose up --build --force-recreate --wait`. No email is sent when a
-complete, verified report cannot be produced.
+`docker compose up --build --force-recreate --wait`. No complete-report email is
+sent without verification. The browser may send the clearly labelled partial
+reading-links bulletin described above when a research/output/cost limit is reached.
 
 ### Spending and diagnostics
 

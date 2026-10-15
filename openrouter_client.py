@@ -154,11 +154,11 @@ class OpenRouterClient:
         if (normal_calls >= self.settings.max_research_rounds * 3 and stage != 'repair' and not length_retry) or (
                 len(self.log.calls) >= self.settings.max_research_rounds * 3 + 1 + self.settings.max_length_retries):
             raise RunLimitReached('Your agent reached its request allowance. Try a narrower question; '
-                                  'review RESEARCH_MAX_ROUNDS (maximum 2) and the run budget.',
+                                  'review RESEARCH_MAX_ROUNDS (maximum 4) and the run budget.',
                                   kind='requests', setting='RESEARCH_MAX_ROUNDS')
         if search and sum(c['search_enabled'] for c in self.log.calls) >= self.settings.max_research_rounds:
             raise RunLimitReached('Your agent reached its search allowance. Try a narrower question; '
-                                  'review RESEARCH_MAX_ROUNDS (maximum 2).',
+                                  'review RESEARCH_MAX_ROUNDS (maximum 4).',
                                   kind='research', setting='RESEARCH_MAX_ROUNDS')
         input_rate, output_rate = self._pricing(model)
         user_text = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
@@ -205,6 +205,13 @@ class OpenRouterClient:
             payload['tools'] = [{'type': 'openrouter:web_search', 'parameters': {
                 'engine': 'parallel', 'mode': 'fast', 'max_results': 5,
                 'max_total_results': 5, 'max_uses': 1, 'max_characters': 2000}}]
+            # Enforce explicit publisher requests at the search engine, not only
+            # in a prompt the model may rewrite into a broad query.
+            domains = data.get('search_domains', []) if isinstance(data, dict) else []
+            approved = {'reuters.com', 'abc.net.au', 'afr.com', 'rba.gov.au',
+                        'finance.yahoo.com', 'investing.com', 'marketscreener.com'}
+            if domains and isinstance(domains, list) and all(d in approved for d in domains):
+                payload['tools'][0]['parameters']['allowed_domains'] = domains
             # Allow the server loop to finish after one search; max_uses still
             # caps actual Parallel searches at one per request.
             payload['max_tool_calls'] = 2

@@ -332,11 +332,14 @@ def cited_source_numbers(report_text: str) -> set[int]:
 
 
 def research_topic(topic: str, settings: Settings, *, thorough: bool = False,
-                   fresh: bool = False, on_progress=None) -> ResearchResult:
+                   fresh: bool = False, on_progress=None, resume_sources=None,
+                   resume_query='', checkpoint=None) -> ResearchResult:
     """Run a three-call fast pipeline or the six-call thorough pipeline."""
     if settings.provider == 'openrouter':
         from research_agent import run_openrouter
-        return run_openrouter(topic, settings, fresh=fresh, on_progress=on_progress)
+        return run_openrouter(topic, settings, fresh=fresh, on_progress=on_progress,
+                              resume_sources=resume_sources, resume_query=resume_query,
+                              checkpoint=checkpoint)
     client_context = genai.Client(api_key=settings.api_key, vertexai=False,
                           http_options=types.HttpOptions(timeout=60_000,
                               retry_options=types.HttpRetryOptions(attempts=2)))

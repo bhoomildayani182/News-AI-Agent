@@ -54,7 +54,7 @@ def get_settings(*, require_api_key: bool = True) -> Settings:
         raise ConfigurationError(f'{key_name} is not set in .env.')
     if provider == 'openrouter':
         model = os.getenv('OPENROUTER_MODEL', DEFAULT_OPENROUTER_MODEL).strip() or DEFAULT_OPENROUTER_MODEL
-        review_model = os.getenv('OPENROUTER_REVIEW_MODEL', 'google/gemini-3.1-flash-lite').strip() or model
+        review_model = os.getenv('OPENROUTER_REVIEW_MODEL', 'google/gemini-3-flash-preview').strip() or model
     else:
         model = os.getenv('GEMINI_MODEL', DEFAULT_MODEL).strip() or DEFAULT_MODEL
         review_model = os.getenv('GEMINI_REVIEW_MODEL', 'gemini-3.7-flash').strip() or model
@@ -73,7 +73,7 @@ def get_settings(*, require_api_key: bool = True) -> Settings:
         reasoning_effort = os.getenv('OPENROUTER_REASONING_EFFORT', 'low').strip().lower() or 'low'
         if not math.isfinite(budget) or not 0 < budget <= 1:
             raise ValueError()
-        if not 1 <= rounds <= 2 or not 0 <= cache_minutes <= 60:
+        if not 1 <= rounds <= 4 or not 0 <= cache_minutes <= 60:
             raise ValueError()
         if (not 256 <= research_tokens <= 16384 or not 256 <= report_tokens <= 16384
                 or not max(research_tokens, report_tokens) <= recovery_tokens <= 32768
@@ -81,7 +81,7 @@ def get_settings(*, require_api_key: bool = True) -> Settings:
                 or reasoning_effort not in {'provider_default', 'none', 'minimal', 'low', 'medium', 'high'}):
             raise ValueError()
     except ValueError:
-        raise ConfigurationError('Use a positive budget up to $1, 1–2 research rounds, '
+        raise ConfigurationError('Use a positive budget up to $1, 1–4 research rounds, '
                                  'and 0–60 cache minutes. Output limits must be 256–16384 tokens; '
                                  'recovery must cover both output limits, up to 32768 tokens. '
                                  'Use 0 or 1 length retries and a valid reasoning effort.') from None
