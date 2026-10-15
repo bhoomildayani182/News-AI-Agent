@@ -5,10 +5,11 @@ import io
 import os
 import unittest
 from unittest.mock import Mock, patch
+from urllib.parse import urlencode
 
 from stages import ResearchError
 from openrouter_client import RunLimitReached, OpenRouterError
-from web_app import HOST, PORT, Handler, JobState, main, page
+from web_app import HOST, PORT, STATE, Handler, JobState, main, page
 
 
 class WebAppTests(unittest.TestCase):
@@ -67,7 +68,12 @@ class WebAppTests(unittest.TestCase):
     def test_container_bind_does_not_relax_browser_host_and_origin_checks(self):
         for headers in ({'Host': 'attacker.example', 'Origin': f'http://{HOST}:{PORT}'},
                         {'Host': f'{HOST}:{PORT}', 'Origin': 'http://attacker.example'},
-                        {'Host': f'0.0.0.0:{PORT}', 'Origin': f'http://0.0.0.0:{PORT}'}):
+                        {'Host': f'0.0.0.0:{PORT}', 'Origin': f'http://0.0.0.0:{PORT}'},
+                        {'Host': f'localhost:{PORT}', 'Origin': 'null'},
+                        {'Host': f'localhost:{PORT}', 'Origin': f'http://{HOST}:{PORT}'},
+                        {'Host': f'localhost:{PORT}', 'Origin': 'http://localhost:9999'},
+                        {'Host': f'localhost.attacker.example:{PORT}'},
+                        {}):
             handler = Handler.__new__(Handler)
             handler.path = '/run'
             handler.headers = headers
@@ -76,6 +82,40 @@ class WebAppTests(unittest.TestCase):
                 handler.do_POST()
             self.assertEqual(handler._respond.call_args.args[0], 403)
             start.assert_not_called()
+
+    def test_local_form_submissions_work_with_both_addresses(self):
+        for authority in (f'{HOST}:{PORT}', f'localhost:{PORT}'):
+            for origin in (None, f'http://{authority}'):
+                with self.subTest(authority=authority, origin=origin):
+                    handler = self._form_handler(authority, origin, STATE.token)
+                    with patch('web_app.STATE.start', return_value=True) as start:
+                        handler.do_POST()
+                    start.assert_called_once_with('Example news topic')
+                    handler.send_response.assert_called_once_with(303)
+                    handler._respond.assert_not_called()
+
+    def test_localhost_still_requires_valid_form_token(self):
+        handler = self._form_handler(f'localhost:{PORT}', f'http://localhost:{PORT}', 'stale-token')
+        with patch('web_app.STATE.start') as start:
+            handler.do_POST()
+        self.assertEqual(handler._respond.call_args.args[0], 403)
+        start.assert_not_called()
+
+    @staticmethod
+    def _form_handler(authority, origin, token):
+        body = urlencode({'topic': 'Example news topic', 'token': token}).encode()
+        handler = Handler.__new__(Handler)
+        handler.path = '/run'
+        handler.headers = {'Host': authority, 'Content-Length': str(len(body)),
+                           'Content-Type': 'application/x-www-form-urlencoded'}
+        if origin is not None:
+            handler.headers['Origin'] = origin
+        handler.rfile = io.BytesIO(body)
+        handler._respond = Mock()
+        handler.send_response = Mock()
+        handler.send_header = Mock()
+        handler.end_headers = Mock()
+        return handler
 
     def test_success_researches_and_sends_one_email(self):
         state = JobState()

@@ -21,6 +21,7 @@ from run_tracking import record_delivery, usage_text
 HOST = '127.0.0.1'
 PORT = 8765
 MAX_FORM_BYTES = 4096
+LOCAL_AUTHORITIES = {f'{HOST}:{PORT}', f'localhost:{PORT}'}
 
 
 class JobState:
@@ -177,8 +178,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != '/run':
             self._respond(404, page(error='Page not found.'))
             return
-        if self.headers.get('Host') != f'{HOST}:{PORT}' or self.headers.get('Origin') not in (None, f'http://{HOST}:{PORT}'):
-            self._respond(403, page(error='Request not allowed.'))
+        # Support both local browser addresses without allowing cross-site posts.
+        # The form token below remains required, including when Origin is absent.
+        authority = self.headers.get('Host', '').lower()
+        if authority not in LOCAL_AUTHORITIES or self.headers.get('Origin') not in (None, f'http://{authority}'):
+            self._respond(403, page(error=(
+                'Open http://127.0.0.1:8765 or http://localhost:8765 on this computer '
+                'and refresh before submitting. Requests from other sites are blocked.')))
             return
         try:
             length = int(self.headers.get('Content-Length', '0'))
@@ -217,7 +223,7 @@ def main():
         print(f'Setup error: {error}')
         return 1
     # Container networking needs all container interfaces, but browser Host/Origin
-    # checks above still use the fixed loopback URL. Compose publishes loopback only.
+    # checks above still require a local browser address. Compose publishes loopback only.
     bind_host = os.getenv('APP_BIND_HOST', HOST).strip() or HOST
     if bind_host not in {HOST, '0.0.0.0'}:
         print('Setup error: APP_BIND_HOST must be 127.0.0.1 or 0.0.0.0.')

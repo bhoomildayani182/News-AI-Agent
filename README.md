@@ -78,7 +78,8 @@ docker compose up --build --wait
 The first run downloads Python and installs dependencies inside the image.
 The command waits for the local page to be healthy and leaves the container running
 in the background. Open **http://127.0.0.1:8765**, enter a topic and click
-**Research and send email**. Use this exact address, not `0.0.0.0` or `localhost`.
+**Research and send email**. `http://localhost:8765` also works. Do not use
+`0.0.0.0` as the browser address. Both local addresses work with Docker or Python.
 Starting the container or its health check does not perform paid research or send email.
 Submitting a topic can incur AI/search charges and sends email only after successful validation.
 
